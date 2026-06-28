@@ -1,0 +1,108 @@
+# ============================================================
+# LAE_pinn — default configuration
+# ============================================================
+
+data:
+  sim_root: "../simulation"           # relative to LAE_pinn/
+  redshifts: [7.14, 6.6, 5.756]
+  box_size_mpc: 160.0                 # cMpc/h
+  grid_full: 512
+  grid_mvp: 64                        # downsampled working resolution
+  muv_cut: -17.5                      # observed-only LAE threshold
+  tigm_key: "TIGM"                    # Lobs/Lint
+
+graph:
+  k_neighbors: 16
+  r_link_mpc: 15.0                    # max edge radius (cMpc/h)
+  node_features:                      # names must match data loader output
+    - pos_x
+    - pos_y
+    - pos_z
+    - muv
+    - log_mass
+    - tigm
+    - ew_obs
+    - lya_obs_norm
+
+gnn:
+  architecture: GATv2Conv             # or SAGEConv
+  n_layers: 3
+  hidden_dim: 64
+  heads: 4                            # for GAT
+  dropout: 0.1
+  output_dim: 32                      # environment embedding size
+
+source_head:
+  f_esc_hidden: [32, 16]
+  xi_ion_learnable: false             # if false, fixed at log10(25.2)
+  xi_ion_log: 25.2                    # ionizing photon production efficiency
+
+kernel:
+  type: mixture                       # "mfp" | "bubble" | "mixture"
+  # Learnable initial values (softplus / sigmoid applied internally)
+  R_init_mpc: 5.0                     # soft bubble radius
+  delta_init_mpc: 1.0                 # bubble edge width
+  lambda_mfp_init_mpc: 20.0          # mean free path
+  A_geom_init: 0.5                    # geom weight before softmax
+  A_trans_init: 0.5                   # trans weight before softmax
+
+unresolved_sources:
+  n_populations: 3                    # bright, faint, diffuse
+  population_labels: [bright, faint, diffuse]
+  density_power_law: true             # ε_b ∝ ρ^α_b
+  smoothness_weight: 1.0e-3          # TV prior on ε_unres
+  lf_prior_weight: 0.1               # KL to luminosity-function budget
+
+excursion_set:
+  threshold_init: 0.0                 # learnable; before sigmoid
+  sharpness_init: 1.0                 # learnable τ; before softplus
+
+training:
+  batch_size: 1                       # 1 snapshot per step (full-field)
+  n_epochs: 200
+  lr: 1.0e-3
+  lr_scheduler: cosine
+  warmup_epochs: 10
+  weight_decay: 1.0e-5
+  loss_weights:
+    field_mse: 1.0
+    power_spectrum: 0.1
+    binary_bce: 0.5
+    mcf_consistency: 0.05
+    global_xHII: 1.0
+    prior: 0.1
+
+evaluation:
+  mcf_r_bins: [2, 4, 6, 8, 10, 15, 20, 30]   # cMpc/h
+  granulometry_r_max: 30.0
+  granulometry_n_steps: 20
+  percolation_threshold: 0.5
+  muv_cuts: [-17.5, -18.0, -19.0]
+
+experiment:
+  seed: 42
+  device: cuda                        # or cpu
+  save_dir: "runs/"
+  log_every: 10
+
+# ============================================================
+# Source degeneracy stress tests
+# ============================================================
+stress_tests:
+  S1_observed_only:
+    muv_cut: -17.5
+    use_all_halos: false
+  S2_oracle_all_halo:
+    muv_cut: -99.0                    # include all
+    use_all_halos: true
+  S3_fixed_source_oracle:
+    source_prescription: "fiducial"   # from simulation
+  S4_wrong_source_massive:
+    force_source_model: "massive_only"  # M_h > 1e11 M_sun
+  S5_wrong_source_faint:
+    force_source_model: "faint_only"    # M_h < 1e10 M_sun
+  S6_learned_mixture:
+    learn_F_b: true
+  S7_ensemble_posterior:
+    train_redshifts: [7.14, 6.6]
+    test_redshifts: [5.756]
