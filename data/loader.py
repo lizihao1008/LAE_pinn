@@ -28,9 +28,9 @@ import torch
 
 # Map human-readable redshift labels to directory names
 SNAPSHOT_DIRS = {
-    7.14:  "Fiducial_z=7.14",
-    6.6:   "Fiducial_z=6.6",
-    5.756: "Fiducial_z=5.756",
+    7.14:  "Fiducial_z_7.14",
+    6.6:   "Fiducial_z_6.6",
+    5.756: "Fiducial_z_5.756",
 }
 
 # True mean ionized fractions from METHODS.md

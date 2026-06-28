@@ -38,12 +38,12 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--sim_root",   default="../simulation")
     p.add_argument("--redshift",   type=float, default=7.14)
-    p.add_argument("--muv_cut",    type=float, default=-17.5,
+    p.add_argument("--muv_cut",    type=float, default=-19,
                    help="MUV cut for observed LAEs. Use -99 for all halos.")
     p.add_argument("--grid",       type=int, default=64)
     p.add_argument("--epochs",     type=int, default=100)
     p.add_argument("--lr",         type=float, default=1e-3)
-    p.add_argument("--device",     default="cpu")
+    p.add_argument("--device",     default="cuda")
     p.add_argument("--save_dir",   default="runs/mvp")
     p.add_argument("--k_neighbors", type=int, default=16)
     p.add_argument("--r_link",     type=float, default=15.0)
