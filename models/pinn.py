@@ -217,29 +217,27 @@ class LAEPINN(nn.Module):
         #    ε_b(x) = 1 + b_b δ_dm(x) is the fixed HOD basis; only f_esc_b learned.
         S_unres = self.unresolved(hod_basis)              # (G, G, G)
 
-        # 6. Amplitude-balance S_obs before combining with S_unres.
+        # 6. Convolve TOTAL source density with radiative kernel K(r; θ_K).
+        #    Both observed LAEs and unresolved halos share the same propagation kernel:
+        #      J_total(x) = (S_obs + S_unres) * K
         #
-        #    HOD basis fields ε_b are normalised to unit mean in preprocessing,
-        #    so  mean(S_unres) = n_bins × <f_esc> ≈ n_bins × 0.5 = O(1–5).
-        #    S_obs amplitude = N_obs × <w_eff> / G³:  with N_obs ~ few thousand and
-        #    G=64,  mean(S_obs) ~ O(1e-3).  The ~1000× imbalance lets S_unres
-        #    dominate J_total completely, washing out all spatial structure from
-        #    the observed LAE scatter regardless of what the GNN learns.
+        #    Amplitude note: HOD basis fields ε_b have unit mean (normalised in
+        #    preprocessing), so mean(S_unres) = Σ_b f_esc_b ~ O(n_bins × 0.5).
+        #    mean(S_obs) = N_obs × <w_eff> / G³ ~ O(1e-3) for N_obs ~ thousands.
+        #    S_unres therefore dominates in amplitude, which is physically correct:
+        #    there are ~100–1000× more faint unresolved halos than detected LAEs.
+        #    Their spatial variation (HOD bias field ε_b, b~3–6 on real data)
+        #    provides the primary ionization structure; S_obs provides a secondary
+        #    high-contrast signal at bright-LAE positions.
+        #    On spatially shuffled data (b≈0), ε_b≈1 everywhere and J_total is
+        #    uniform regardless of S_obs amplitude — the data, not the model, is
+        #    the limiting factor.
         #
-        #    Fix: normalise S_obs to unit mean (same convention as ε_b) before
-        #    the convolution.  This is safe because J_total is re-scaled by its
-        #    own spatial mean in step 7 anyway — only the spatial *contrast* of
-        #    J matters for x_pred, not its absolute level.
-        #
-        #    After this normalisation, S_obs contributes mean=1 and S_unres
-        #    contributes mean = n_bins × f_esc  (~0–9).  As training proceeds,
-        #    f_esc drives to small values, balancing the two terms.
-        S_obs_scale = S_obs.mean().detach().clamp(min=1e-12)
-        S_obs_normed = S_obs / S_obs_scale   # unit mean; spatial structure preserved
-
-        # 6b. Convolve TOTAL source density with radiative kernel K(r; θ_K).
-        #     J_total(x) = (S_obs_normed + S_unres) * K
-        J_total = fft_convolve_3d(S_obs_normed + S_unres, kernel_grid)   # (G, G, G)
+        #    J_total is normalised by its spatial mean in step 7, so the absolute
+        #    amplitude cancels; only spatial contrast (std/mean of J) matters for
+        #    x_pred.
+        S_obs_scale = S_obs.mean().detach().clamp(min=1e-12)   # for diagnostics only
+        J_total = fft_convolve_3d(S_obs + S_unres, kernel_grid)   # (G, G, G)
 
         # 7. J → x_HII
         # Normalise J by its spatial mean before the excursion mapping.
@@ -275,13 +273,12 @@ class LAEPINN(nn.Module):
 
         if return_intermediates:
             out.update({
-                "S_obs":       S_obs,         # raw scatter grid (pre-normalisation)
-                "S_obs_normed":S_obs_normed,  # unit-mean scatter grid (fed into convolution)
-                "S_unres":     S_unres,       # unresolved source density (pre-kernel)
-                "J_total":     J_total,       # (S_obs_normed + S_unres) * K
+                "S_obs":       S_obs,       # scatter grid of LAEs  (pre-kernel)
+                "S_unres":     S_unres,     # unresolved source density (pre-kernel)
+                "J_total":     J_total,     # (S_obs + S_unres) * K  (radiation field)
                 "kernel_grid": kernel_grid,
                 # backward-compat aliases used by loss.py (TV prior on J_unres)
-                "J_obs":       S_obs_normed,
+                "J_obs":       S_obs,
                 "J_unres":     S_unres,
             })
 

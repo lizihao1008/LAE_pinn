@@ -79,7 +79,12 @@ unresolved_sources:
 excursion_set:
   # s = alpha_nH_scale: one scalar for α(T)·⟨n_H⟩ + J unit conversion
   # Mapping: A = g·J/s,  x_HII = (√(A²+4A)−A)/2;  g from global ξ constraint
-  alpha_nH_scale_init: 1.0
+  #
+  # IMPORTANT: run_mvp.py and run_stress.py override this value at runtime
+  # using the exact analytic inverse:  A = xi^2/(1-xi),  alpha_init = 1/A.
+  # Example: xi=0.308 → alpha_init ≈ 7.3.  The default of 1.0 is 6× too
+  # small and causes x_pred to be pinned above 0.5 for hundreds of epochs.
+  alpha_nH_scale_init: 1.0   # overridden by runners; do not rely on this value
 
 training:
   batch_size: 1                       # 1 snapshot per step (full-field)

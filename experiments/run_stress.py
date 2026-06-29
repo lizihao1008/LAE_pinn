@@ -75,10 +75,17 @@ def run_stress_test(name: str, cfg_st: dict, args, device: torch.device) -> dict
                                  hod_calibration=hod_calibration)
     graph = build_graph_from_snapshot(snap_dict, subsample=args.subsample)
 
+    # Initialise alpha from xi_global (exact analytic inverse of excursion equation)
+    xi_val     = float(snap.xi_global)
+    xi_clamped = max(min(xi_val, 0.995), 0.005)
+    A_target   = xi_clamped ** 2 / (1.0 - xi_clamped)
+    alpha_init = 1.0 / max(A_target, 1e-6)
+
     model = LAEPINN(
         gnn_in_channels=8, gnn_hidden_dim=32, gnn_out_channels=16,
         gnn_n_layers=3, gnn_heads=2, n_hod_bins=3,
         grid_size=args.grid, box_size=snap.box_size,
+        alpha_nH_scale_init=alpha_init,
     )
 
     cfg_train = {

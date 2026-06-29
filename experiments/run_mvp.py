@@ -133,6 +133,18 @@ def main():
 
     # ---- 4. Model ----
     print("Initialising LAEPINN...")
+    # Compute alpha_nH_scale_init from xi_global.
+    # Exact analytic inverse of x_HII = (sqrt(A^2+4A)-A)/2 evaluated at xi:
+    #   A = xi^2 / (1 - xi),   alpha_init = 1 / A.
+    # This ensures mean(x_pred) starts near xi_global when J_norm ≈ 1 (uniform),
+    # preventing alpha from being 6x too small and x_pred pinned above 0.5 for
+    # hundreds of epochs while the global_xHII loss slowly pulls it down.
+    xi_val     = float(snap.xi_global)
+    xi_clamped = max(min(xi_val, 0.995), 0.005)
+    A_target   = xi_clamped ** 2 / (1.0 - xi_clamped)
+    alpha_init = 1.0 / max(A_target, 1e-6)
+    print(f"  alpha_nH_scale_init = {alpha_init:.2f}  (xi_global={xi_val:.3f} → A_target={A_target:.3f})")
+
     model = LAEPINN(
         gnn_in_channels=8,
         gnn_hidden_dim=64,
@@ -146,6 +158,7 @@ def main():
         n_hod_bins=n_hod_bins,
         grid_size=args.grid,
         box_size=snap.box_size,
+        alpha_nH_scale_init=alpha_init,
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Trainable parameters: {n_params:,}")

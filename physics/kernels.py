@@ -205,6 +205,20 @@ def make_3d_kernel_grid(
     cx, cy, cz = torch.meshgrid(coords, coords, coords, indexing="ij")
     r3d = (cx ** 2 + cy ** 2 + cz ** 2).sqrt()  # (G, G, G)
 
+    # Clamp r to a minimum of half the voxel size.
+    #
+    # The k_mfp kernel has a 1/(4πr² + ε) factor that diverges at r=0.
+    # With ε=1e-4 and dx=2.5 Mpc/h, k_mfp(r=0)/k_mfp(r=dx) ≈ 890,000×.
+    # After normalisation, K is effectively a delta function — convolution
+    # reduces to J(x) ≈ S(x) with no photon propagation at all.
+    #
+    # Physical motivation for the clamp: each grid voxel represents a finite
+    # volume of size dx³, so sources are not true point sources.  The effective
+    # minimum propagation radius is half the voxel size (dx/2).
+    # With this clamp, k_mfp(r=0)/k_mfp(r=dx) ≈ 4×, which is physically
+    # reasonable and lets photons propagate meaningfully across the grid.
+    r3d = r3d.clamp(min=dx / 2)
+
     # Evaluate kernel WITHOUT torch.no_grad() so that gradients flow back
     # through K_fft → J_fft → loss to the kernel parameters (R, Δ, λ).
     k3d = kernel(r3d)               # (G, G, G)
