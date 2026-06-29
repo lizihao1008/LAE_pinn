@@ -158,11 +158,14 @@ def main():
             "warmup_epochs": 10,
             "weight_decay": 1e-5,
             "loss_weights": {
-                "field_mse": 1.0,
+                "field_mse":      1.0,
                 "power_spectrum": 0.1,
-                "binary_bce": 0.5,
-                "global_xHII": 1.0,
-                "prior": 0.1,
+                "binary_bce":     0.5,
+                # global_xHII needs a high weight to drive alpha_nH_scale fast.
+                # With uniform J_norm, the excursion gradient on alpha is tiny,
+                # so a weak xHII weight leaves alpha stuck near init for hundreds of epochs.
+                "global_xHII":   10.0,
+                "prior":          0.1,
             },
         },
         "experiment": {"log_every": max(1, args.epochs // 10)},

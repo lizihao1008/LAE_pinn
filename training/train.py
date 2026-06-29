@@ -134,10 +134,15 @@ def train(
             # Diagnostics from the last graph in this epoch
             with torch.no_grad():
                 last_out    = model(graph, hod_basis=graph.hod_basis,
-                                    return_intermediates=False)
-                x_pred_mean  = float(last_out["x_hii_pred"].mean().item())
-                j_scale_val  = last_out.get("J_scale", float("nan"))
-                s_obs_scale  = last_out.get("S_obs_scale", float("nan"))
+                                    return_intermediates=True)
+                x_pred      = last_out["x_hii_pred"]
+                x_pred_mean = float(x_pred.mean().item())
+                x_pred_std  = float(x_pred.std().item())   # spatial contrast: 0 = uniform
+                j_scale_val = last_out.get("J_scale", float("nan"))
+                s_obs_scale = last_out.get("S_obs_scale", float("nan"))
+                # J_norm spatial contrast: how much variation the kernel actually sees
+                j_total     = last_out.get("J_total")
+                j_norm_std  = float((j_total / j_total.mean()).std().item()) if j_total is not None else float("nan")
 
             xi_last   = float(graph.xi_global)
             n_bins    = model.unresolved.n_bins
@@ -157,8 +162,9 @@ def train(
                 f"Loss={epoch_losses['total']:.4f} | "
                 f"field={epoch_losses['field']:.4f} | "
                 f"xHII={epoch_losses['xhii']:.4f} | "
-                f"<x_pred>={x_pred_mean:.3f} ξ={xi_last:.3f} | "
-                f"α={phys.get('alpha_nH_scale', 0):.3f} J̄={j_scale_val:.2e} Sobs={s_obs_scale:.2e} | "
+                f"<x>={x_pred_mean:.3f}±{x_pred_std:.3f} ξ={xi_last:.3f} | "
+                f"Jσ={j_norm_std:.3f} Sobs={s_obs_scale:.2e} | "
+                f"α={phys.get('alpha_nH_scale', 0):.3f} "
                 f"R={phys.get('R_bub', 0):.2f} λ={phys.get('lambda_mfp', 0):.2f} | "
                 f"{fesc_str} | {dt:.1f}s"
             )
