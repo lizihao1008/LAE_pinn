@@ -111,7 +111,7 @@ def main():
         kernel_R_init=5.0,
         kernel_delta_init=1.0,
         kernel_lambda_mfp_init=20.0,
-        n_populations=3,
+        n_hod_bins=3,
         grid_size=args.grid,
         box_size=snap.box_size,
     )
@@ -145,8 +145,7 @@ def main():
     graph = graph.to(device)
 
     with torch.no_grad():
-        out = model(graph, graph.density_basis, xi_global=graph.xi_global,
-                    return_intermediates=True)
+        out = model(graph, hod_basis=graph.hod_basis, return_intermediates=True)
 
     x_pred_np = out["x_hii_pred"].cpu().numpy()
     x_true_np = graph.xbox_true.squeeze().cpu().numpy()

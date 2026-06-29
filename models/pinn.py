@@ -4,19 +4,17 @@ Full PINN: LAE-conditioned photon-budget and ionization-topology inference.
 
 Forward pass:
     LAE graph  →  GNN encoder  →  source head  →  f_esc_i, w_i
-               →  scatter w_i onto 3D grid
-               →  FFT convolve with learnable physical kernel K(r; θ_K)
-               →  J_obs(x)
-               →  add ε_unres(x; F_b, density_basis)
-               →  J_total(x)
-               →  soft excursion-set mapping
+               →  scatter w_i onto 3D grid  →  S_obs(x)
+               →  S_unres(x) = Σ_b f_esc_b · ε_b(x)   [HOD basis, fixed]
+               →  J_total(x) = (S_obs + S_unres) * K(r; θ_K)   [one FFT]
+               →  ionization equilibrium  A = J/s,  x_HII = (√(A²+4A)-A)/2
                →  x̂_HII(x)
 
 Outputs:
     x_hii_pred :  (G, G, G) predicted ionization field
-    F_b        :  (n_populations,) source-budget fractions
-    theta_K    :  dict of learnable kernel parameters
+    f_esc_bins :  (n_hod_bins,) HOD escape fractions per mass bin
     f_esc      :  (N,) per-LAE escape fractions
+    theta_K    :  dict of learnable kernel parameters
 """
 
 from __future__ import annotations
@@ -24,10 +22,16 @@ import torch
 import torch.nn as nn
 from torch_geometric.data import Data
 
-from ..physics.kernels import MixtureKernel, build_kernel, make_3d_kernel_grid
-from ..physics.scatter import scatter_and_convolve
-from ..physics.unresolved_sources import UnresolvedSourceField
-from ..physics.excursion_set import ExcursionSetMapping
+try:
+    from ..physics.kernels import MixtureKernel, build_kernel, make_3d_kernel_grid
+    from ..physics.scatter import scatter_to_grid, fft_convolve_3d
+    from ..physics.unresolved_sources import HODUnresolvedField
+    from ..physics.excursion_set import ExcursionSetMapping
+except ImportError:  # python -m experiments.run_mvp with project root on sys.path
+    from physics.kernels import MixtureKernel, build_kernel, make_3d_kernel_grid
+    from physics.scatter import scatter_to_grid, fft_convolve_3d
+    from physics.unresolved_sources import HODUnresolvedField
+    from physics.excursion_set import ExcursionSetMapping
 from .gnn_encoder import build_gnn_encoder
 from .source_head import SourceHead
 
@@ -53,17 +57,19 @@ class LAEPINN(nn.Module):
         source_hidden_dims: list[int] | None = None,
         xi_ion_learnable: bool = False,
         xi_ion_log: float = 25.2,
+        # RSD correction
+        learn_rsd_correction: bool = False,
+        rsd_max_shift_mpc: float = 2.0,    # cMpc/h, ~1 voxel at 64³
+        los_axis: int = 2,                  # which axis is line-of-sight (0/1/2)
         # Kernel
         kernel_type: str = "mixture",
         kernel_R_init: float = 5.0,
         kernel_delta_init: float = 1.0,
         kernel_lambda_mfp_init: float = 20.0,
-        # Unresolved sources
-        n_populations: int = 3,
-        lf_prior: torch.Tensor | None = None,
-        # Excursion set
-        threshold_init: float = 0.0,
-        sharpness_init: float = 1.0,
+        # Unresolved sources (HOD-based)
+        n_hod_bins: int = 3,
+        # Ionization equilibrium  A = J / alpha_nH_scale
+        alpha_nH_scale_init: float = 1.0,
         excursion_learnable: bool = True,
         # Grid
         grid_size: int = 64,
@@ -73,6 +79,7 @@ class LAEPINN(nn.Module):
 
         self.grid_size = grid_size
         self.box_size  = box_size
+        self.los_axis  = los_axis
 
         # --- GNN encoder ---
         self.gnn = build_gnn_encoder(
@@ -91,6 +98,9 @@ class LAEPINN(nn.Module):
             hidden_dims=source_hidden_dims,
             xi_ion_learnable=xi_ion_learnable,
             xi_ion_log=xi_ion_log,
+            learn_rsd_correction=learn_rsd_correction,
+            rsd_max_shift_mpc=rsd_max_shift_mpc,
+            box_size=box_size,
         )
 
         # --- Physical radiative kernel ---
@@ -104,7 +114,10 @@ class LAEPINN(nn.Module):
             **({} if kernel_type == "bubble" else {})
         )
         # Rebuild for any type cleanly
-        from ..physics.kernels import KERNEL_REGISTRY
+        try:
+            from ..physics.kernels import KERNEL_REGISTRY
+        except ImportError:
+            from physics.kernels import KERNEL_REGISTRY
         k_kwargs = {}
         if kernel_type == "mixture":
             k_kwargs = dict(
@@ -118,23 +131,24 @@ class LAEPINN(nn.Module):
             k_kwargs = dict(lambda_mfp_init=kernel_lambda_mfp_init)
         self.kernel = KERNEL_REGISTRY[kernel_type](**k_kwargs)
 
-        # --- Unresolved source field ---
-        self.unresolved = UnresolvedSourceField(
-            n_populations=n_populations,
-            lf_prior=lf_prior,
-        )
+        # --- Unresolved source field (HOD-based) ---
+        # Basis fields are fixed from HOD calibration (pre-computed before training).
+        # Only f_esc per mass bin is learned.
+        self.unresolved = HODUnresolvedField(n_bins=n_hod_bins)
 
-        # --- Excursion-set mapping ---
+        # --- Ionization equilibrium ---
+        # Photoionization balance Γ(1−x)n_H = α n_e n_p  →  x_HII(J) via A=J/s.
+        # Single learnable s absorbs recombination coeff α and mean density n_H
+        # (neither is directly observable at z~7).
         self.excursion = ExcursionSetMapping(
-            threshold_init=threshold_init,
-            sharpness_init=sharpness_init,
+            alpha_nH_scale_init=alpha_nH_scale_init,
             learnable=excursion_learnable,
         )
 
     def forward(
         self,
         graph: Data,
-        density_basis: torch.Tensor,    # (P, G, G, G)
+        hod_basis: torch.Tensor,        # (n_bins, G, G, G)
         xi_global: float | None = None,
         return_intermediates: bool = False,
     ) -> dict[str, torch.Tensor]:
@@ -146,19 +160,20 @@ class LAEPINN(nn.Module):
             edge_index  (2, E)
             edge_attr   (E, 4)
             pos         (N, 3) positions in [0, 1]
-            src_weights (N,) raw source weights L_i normalised
-        density_basis : (P, G, G, G) density bias basis fields
-        xi_global     : float, target global ionized fraction for calibration
+            src_weights (N,) raw source weights (log10 L_Lyα normalised)
+        hod_basis         : (n_bins, G, G, G) HOD basis fields, fixed (pre-computed)
+        xi_global         : float, not used in forward (kept for API compat)
         return_intermediates : bool, whether to return J_obs, J_unres, J_total
 
         Returns
         -------
         dict with:
             x_hii_pred    (G, G, G)
-            F_b           (P,)
-            f_esc         (N,)
+            f_esc_bins    (n_bins,) learned escape fractions
+            f_esc         (N,) per-LAE escape fractions
             theta_K       dict of kernel parameter values
-            [optionally] J_obs, J_unres, J_total
+            J_scale       float, mean(J_total) used for normalisation
+            [optionally] J_obs, J_unres, J_total, kernel_grid
         """
         device = graph.x.device
         G = self.grid_size
@@ -166,45 +181,89 @@ class LAEPINN(nn.Module):
         # 1. GNN: node features → environment embeddings
         h = self.gnn(graph.x, graph.edge_index, graph.edge_attr)   # (N, d)
 
-        # 2. Source head: h → f_esc, w_eff
+        # 2. Source head: h → f_esc, w_eff (and optionally Δr∥)
         w_eff, src_info = self.source_head.compute_source_weights(
             h, graph.src_weights
         )   # (N,)
 
+        # 2b. Learned RSD correction: shift scatter positions along LOS
+        #     pos is in [0,1]; delta_los is also in [0,1] (normalised by box_size).
+        #     The trilinear scatter is differentiable w.r.t. the fractional part of
+        #     the position, so gradient flows back to delta_los_mlp for sub-voxel
+        #     shifts (typical RSD amplitude ~0.5–1 voxel at 64³, z~7).
+        if "delta_los" in src_info:
+            delta_los = src_info["delta_los"]   # (N,) in normalised [0,1] space
+            z = torch.zeros_like(delta_los)
+            if self.los_axis == 0:
+                delta_3d = torch.stack([delta_los, z, z], dim=-1)
+            elif self.los_axis == 1:
+                delta_3d = torch.stack([z, delta_los, z], dim=-1)
+            else:  # los_axis == 2 (default)
+                delta_3d = torch.stack([z, z, delta_los], dim=-1)
+            # graph.pos has no grad; delta_3d carries grad through delta_los
+            pos_scatter = graph.pos + delta_3d   # (N, 3), grad flows via delta_3d
+            pos_scatter = pos_scatter % 1.0       # periodic wrap (differentiable away from boundaries)
+        else:
+            pos_scatter = graph.pos
+
         # 3. Build 3D kernel on grid (uses current learnable parameters)
         kernel_grid = make_3d_kernel_grid(self.kernel, G, self.box_size, device)
 
-        # 4. Scatter + convolve: LAE sources → J_obs(x)
-        J_obs = scatter_and_convolve(
-            pos_norm=graph.pos,        # (N, 3) in [0, 1]
-            weights=w_eff,
-            kernel_grid=kernel_grid,
-            grid_size=G,
-        )   # (G, G, G)
+        # 4. Scatter LAE sources onto grid — source density, NOT radiation field yet.
+        #    S_obs(x) = Σ_i w_i δ³(x - x̃_i)
+        S_obs = scatter_to_grid(pos_scatter, w_eff, G)   # (G, G, G)
 
-        # 5. Unresolved source emissivity: ε_unres(x; F_b)
-        J_unres = self.unresolved(density_basis)   # (G, G, G)
+        # 5. Unresolved source density: S_unres(x) = Σ_b f_esc_b · ε_b(x)
+        #    ε_b(x) = 1 + b_b δ_dm(x) is the fixed HOD basis; only f_esc_b learned.
+        S_unres = self.unresolved(hod_basis)              # (G, G, G)
 
-        # 6. Total ionizing flux
-        J_total = J_obs + J_unres   # (G, G, G)
+        # 6. Convolve TOTAL source density with radiative kernel K(r; θ_K).
+        #    Both observed LAEs and unresolved halos share the same propagation kernel:
+        #      J_total(x) = (S_obs + S_unres) * K
+        #    By linearity this equals (S_obs * K) + (S_unres * K), but one
+        #    FFT convolution is cheaper and the notation is cleaner.
+        J_total = fft_convolve_3d(S_obs + S_unres, kernel_grid)   # (G, G, G)
 
-        # 7. Soft excursion-set → x_HII
-        x_hii_pred = self.excursion(J_total, xi_global=xi_global)   # (G, G, G)
+        # 7. J → x_HII
+        # Normalise J by its spatial mean before the excursion mapping.
+        # Without this, J values (~1e-3) are orders of magnitude below
+        # alpha_nH_scale (~1.0), giving A = J/s << 1 and x_pred ≈ 0 everywhere
+        # regardless of the spatial structure.  After normalisation:
+        #   mean(J_norm) = 1  →  A ~ 1/s  ~  1 at init  →  x_pred ~ 0.6
+        # which is already near xi_global, so alpha_nH_scale only needs to
+        # fine-tune the transition sharpness via the global_xHII loss.
+        # J_scale is detached so the normalisation constant doesn't zero out
+        # the spatial gradients of J_total.
+        J_scale    = J_total.mean().detach().clamp(min=1e-12)
+        x_hii_pred = self.excursion(J_total / J_scale)
 
         out = {
-            "x_hii_pred": x_hii_pred,
-            "F_b":        self.unresolved.F_b,
-            "f_esc":      src_info["f_esc"],
-            "theta_K":    self.kernel.get_params_dict() if hasattr(self.kernel, "get_params_dict")
-                          else {},
+            "x_hii_pred":  x_hii_pred,
+            "f_esc_bins":  self.unresolved.f_esc_bins,   # (n_bins,) HOD escape fractions
+            "f_esc":       src_info["f_esc"],             # (N,) per-LAE escape fractions
+            "theta_K":     self.kernel.get_params_dict() if hasattr(self.kernel, "get_params_dict")
+                           else {},
         }
+
+        # Expose RSD correction stats for logging/diagnostics
+        if "delta_los" in src_info:
+            dl = src_info["delta_los"].detach()
+            box = self.box_size
+            out["delta_los_mean_mpc"] = float(dl.mean().item() * box)
+            out["delta_los_std_mpc"]  = float(dl.std().item()  * box)
+
+        # Always expose J_scale so the training loop can log it cheaply
+        out["J_scale"] = float(J_scale.item())
 
         if return_intermediates:
             out.update({
-                "J_obs":        J_obs,
-                "J_unres":      J_unres,
-                "J_total":      J_total,
-                "kernel_grid":  kernel_grid,
+                "S_obs":       S_obs,       # scatter grid of LAEs  (pre-kernel)
+                "S_unres":     S_unres,     # unresolved source density (pre-kernel)
+                "J_total":     J_total,     # (S_obs + S_unres) * K  (radiation field)
+                "kernel_grid": kernel_grid,
+                # backward-compat aliases used by loss.py (TV prior on J_unres)
+                "J_obs":       S_obs,
+                "J_unres":     S_unres,
             })
 
         return out
@@ -214,9 +273,9 @@ class LAEPINN(nn.Module):
         params = {}
         if hasattr(self.kernel, "get_params_dict"):
             params.update(self.kernel.get_params_dict())
-        params.update(self.unresolved.get_fractions())
-        params["threshold"] = float(self.excursion.threshold.item())
-        params["sharpness"] = float(self.excursion.sharpness.item())
+        # f_esc per HOD mass bin (keys: "fesc_bin0", "fesc_bin1", ...)
+        params.update(self.unresolved.get_fesc_dict())
+        params["alpha_nH_scale"] = float(self.excursion.alpha_nH_scale.item())
         return params
 
 
@@ -233,6 +292,7 @@ def build_pinn_from_config(cfg: dict) -> LAEPINN:
     exc_cfg    = cfg.get("excursion_set", {})
     data_cfg   = cfg.get("data", {})
 
+    rsd_cfg = cfg.get("rsd_correction", {})
     return LAEPINN(
         gnn_architecture=gnn_cfg.get("architecture", "GATv2Conv"),
         gnn_in_channels=len(cfg.get("graph", {}).get("node_features", range(8))),
@@ -244,13 +304,18 @@ def build_pinn_from_config(cfg: dict) -> LAEPINN:
         source_hidden_dims=src_cfg.get("f_esc_hidden", [32, 16]),
         xi_ion_learnable=src_cfg.get("xi_ion_learnable", False),
         xi_ion_log=src_cfg.get("xi_ion_log", 25.2),
+        learn_rsd_correction=rsd_cfg.get("enabled", False),
+        rsd_max_shift_mpc=rsd_cfg.get("max_shift_mpc", 2.0),
+        los_axis=rsd_cfg.get("los_axis", 2),
         kernel_type=ker_cfg.get("type", "mixture"),
         kernel_R_init=ker_cfg.get("R_init_mpc", 5.0),
         kernel_delta_init=ker_cfg.get("delta_init_mpc", 1.0),
         kernel_lambda_mfp_init=ker_cfg.get("lambda_mfp_init_mpc", 20.0),
-        n_populations=unr_cfg.get("n_populations", 3),
-        threshold_init=exc_cfg.get("threshold_init", 0.0),
-        sharpness_init=exc_cfg.get("sharpness_init", 1.0),
+        n_hod_bins=unr_cfg.get("n_hod_bins", unr_cfg.get("n_populations", 3)),
+        alpha_nH_scale_init=exc_cfg.get(
+            "alpha_nH_scale_init",
+            exc_cfg.get("alpha_scale_init", exc_cfg.get("sharpness_init", 1.0)),
+        ),
         grid_size=data_cfg.get("grid_mvp", 64),
         box_size=data_cfg.get("box_size_mpc", 160.0),
     )

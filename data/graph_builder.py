@@ -26,28 +26,20 @@ def build_knn_graph(
     k: int = 16,
     r_max: float = 15.0,       # max edge length (cMpc/h)
     device: str | torch.device = "cpu",
-    subsample: int | None = None,
 ) -> Data:
     """
     Build a k-NN graph with periodic boundary conditions.
-
-    For large N (> ~50 000), exact pairwise distances are expensive.
-    Use subsample to randomly thin the catalog first (for speed),
-    or use a spatial tree approach.
 
     Returns a PyG Data object with:
         x:          (N, F) node features
         pos:        (N, 3) normalised positions [0,1]
         edge_index: (2, E) source/target indices
         edge_attr:  (E, 4) [r, dx/r, dy/r, dz/r] edge features
+
+    Subsampling should be done BEFORE calling this function (see
+    build_graph_from_snapshot) so that all per-node arrays stay aligned.
     """
     N = len(pos)
-
-    if subsample is not None and N > subsample:
-        idx = np.random.choice(N, subsample, replace=False)
-        pos = pos[idx]
-        node_feats = node_feats[idx]
-        N = subsample
 
     # For large catalogs use a KD-tree; for small ones brute-force is fine.
     # We use scipy's cKDTree with PBC via repeated copies in border regions.
@@ -114,10 +106,22 @@ def build_graph_from_snapshot(
         src_weights: (N,)  raw source weights
         xi_global:  scalar
         xbox_true:  (1,1,G,G,G)
+
+    Subsampling is done here so that pos_raw, node_feats and src_weights
+    are all sliced with the same index before the graph is built.
     """
-    pos_raw   = snap_dict["pos_raw"].cpu().numpy()
-    node_feats = snap_dict["node_feats"]
-    device    = node_feats.device
+    pos_raw    = snap_dict["pos_raw"].cpu().numpy()       # (N, 3)
+    node_feats = snap_dict["node_feats"]                  # (N, F)
+    src_weights = snap_dict["src_weights"]                # (N,)
+    device     = node_feats.device
+    N          = len(pos_raw)
+
+    # ── Subsample all per-node arrays with the same index ──────────
+    if subsample is not None and N > subsample:
+        idx         = np.random.choice(N, subsample, replace=False)
+        pos_raw     = pos_raw[idx]
+        node_feats  = node_feats[idx]
+        src_weights = src_weights[idx]
 
     graph = build_knn_graph(
         pos=pos_raw,
@@ -126,15 +130,15 @@ def build_graph_from_snapshot(
         k=k,
         r_max=r_max,
         device=device,
-        subsample=subsample,
     )
 
-    # Attach extra fields
-    graph.src_weights   = snap_dict["src_weights"]
-    graph.pos_raw       = snap_dict["pos_raw"]         # (N, 3) cMpc/h
-    graph.xbox_true     = snap_dict["xbox_true"]       # (1,1,G,G,G)
-    graph.density_basis = snap_dict["density_basis"]   # (P,G,G,G)
-    graph.xi_global     = snap_dict["xi_global"]
+    # Attach extra fields (all now consistent with the subsampled N)
+    graph.src_weights     = src_weights
+    graph.pos_raw         = torch.from_numpy(pos_raw.astype(np.float32)).to(device)
+    graph.xbox_true       = snap_dict["xbox_true"]        # (1,1,G,G,G) — grid, unchanged
+    graph.hod_basis       = snap_dict["hod_basis"]        # (n_bins,G,G,G) — HOD basis fields
+    graph.hod_calibration = snap_dict["hod_calibration"]  # HODCalibration, for logging
+    graph.xi_global       = snap_dict["xi_global"]
     graph.z             = snap_dict["z"]
     graph.box_size      = snap_dict["box_size"]
     graph.grid_size     = snap_dict["grid_size"]

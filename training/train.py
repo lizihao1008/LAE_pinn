@@ -16,8 +16,12 @@ import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from ..models.pinn import LAEPINN
-from ..training.loss import PINNLoss
+try:
+    from ..models.pinn import LAEPINN
+    from ..training.loss import PINNLoss
+except ImportError:
+    from models.pinn import LAEPINN
+    from training.loss import PINNLoss
 
 
 def train(
@@ -74,8 +78,9 @@ def train(
 
             out = model(
                 graph,
-                density_basis=graph.density_basis,
-                xi_global=graph.xi_global,
+                hod_basis=graph.hod_basis,
+                # xi_global not passed: no binary-search calibration.
+                # alpha_nH_scale is trained via the global_xHII loss instead.
                 return_intermediates=True,
             )
 
@@ -84,6 +89,15 @@ def train(
             total, components = loss_fn(
                 out, x_true, graph.xi_global, model.unresolved
             )
+
+            # Guard: skip gradient step if loss is NaN/Inf (can happen in
+            # early training before parameters settle)
+            if torch.isnan(total) or torch.isinf(total):
+                print(f"  [epoch {epoch}] NaN/Inf loss — skipping step "
+                      f"(components: { {k: f'{v:.3g}' for k,v in components.items()} })")
+                optimizer.zero_grad()
+                continue
+
             total.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -103,13 +117,35 @@ def train(
         if verbose and epoch % log_every == 0:
             dt = time.time() - t0
             phys = model.get_learnable_physics()
+
+            # Diagnostics from the last graph in this epoch
+            with torch.no_grad():
+                last_out    = model(graph, hod_basis=graph.hod_basis,
+                                    return_intermediates=False)
+                x_pred_mean = float(last_out["x_hii_pred"].mean().item())
+                j_scale_val = last_out.get("J_scale", float("nan"))
+
+            xi_last   = float(graph.xi_global)
+            n_bins    = model.unresolved.n_bins
+            fesc_vals = [phys.get(f"fesc_bin{b}", 0.0) for b in range(n_bins)]
+            fesc_str  = " ".join(f"fesc[{b}]={v:.3f}" for b, v in enumerate(fesc_vals))
+
+            # HOD calibration summary (logged once per snapshot)
+            hod_cal   = graph.hod_calibration
+            bias_info = " ".join(
+                f"b{b}={hod_cal.hod_params['bias'][b]:.1f}"
+                for b in range(len(hod_cal.bin_labels))
+            )
+
             print(
                 f"Epoch {epoch:4d}/{n_epochs} | "
                 f"Loss={epoch_losses['total']:.4f} | "
                 f"field={epoch_losses['field']:.4f} | "
                 f"xHII={epoch_losses['xhii']:.4f} | "
-                f"R={phys.get('R_bub', 0):.2f} λ={phys.get('lambda_mfp', 0):.2f} "
-                f"F_bright={phys.get('bright', 0):.2f} | {dt:.1f}s"
+                f"<x_pred>={x_pred_mean:.3f} ξ={xi_last:.3f} | "
+                f"α={phys.get('alpha_nH_scale', 0):.3f} J̄={j_scale_val:.2e} | "
+                f"R={phys.get('R_bub', 0):.2f} λ={phys.get('lambda_mfp', 0):.2f} | "
+                f"{fesc_str} | HOD[{bias_info}] | {dt:.1f}s"
             )
 
     # Save

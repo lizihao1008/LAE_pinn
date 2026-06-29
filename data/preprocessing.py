@@ -1,9 +1,34 @@
 """
 data/preprocessing.py
-Grid downsampling, feature normalisation, and node-feature assembly.
+Grid downsampling, feature normalisation, node-feature assembly, and
+HOD calibration for the unresolved faint-source emissivity field.
+
+HOD calibration overview
+------------------------
+The unresolved source term ε_unres(x) = Σ_b f_esc_b · ε_b(x) requires
+pre-computed basis fields ε_b(x) that encode the spatial clustering of
+faint halos in each mass / M_UV bin.
+
+Two calibration paths share the same HODCalibration interface:
+
+  Simulation path   — build_hod_basis_from_simulation()
+      Uses the full halo catalog (including faint halos below the detection
+      threshold).  Measures linear bias directly from the cross-correlation
+      of halo number density with the DM density field.  No HMF assumption.
+
+  Observations path — build_hod_basis_from_observations()
+      Takes pre-fitted HOD parameters (bias, n_bar) from ACF fitting and
+      a density proxy field (e.g. smoothed LAE density or WL convergence).
+      This is the interface to use when applying the trained model to real data.
+
+Both functions return a HODCalibration dataclass whose .basis_fields tensor
+has shape (n_bins, G, G, G) with unit mean per bin.  The HODUnresolvedField
+model in physics/unresolved_sources.py is identical in both cases.
 """
 
 from __future__ import annotations
+from dataclasses import dataclass, field as dc_field
+
 import numpy as np
 import torch
 from scipy.ndimage import zoom
@@ -36,20 +61,38 @@ def grid_to_tensor(grid: np.ndarray, device: str | torch.device = "cpu") -> torc
 _FEATURE_STATS: dict[str, tuple[float, float]] = {}  # filled lazily
 
 
+def _log10_lya(lya_obs: np.ndarray) -> np.ndarray:
+    """
+    Safe log10 of Lyα luminosity.
+
+    Two issues in real catalogs:
+      1. Negative values (numerical noise in the RT output) → clip to 0 first.
+      2. Exact zeros (full IGM attenuation at z~7) → add a floor eps so
+         log10 is finite everywhere.
+
+    eps is set to 1e-10 × max(L_Lyα), falling back to 1.0 when max == 0.
+    The resulting values are in log10 space (float64).
+    """
+    lya = np.clip(lya_obs, 0.0, None)          # kill negatives before log
+    lya_max = lya.max()
+    eps = max(float(lya_max) * 1e-10, 1.0)     # relative floor, abs fallback
+    return np.log10(lya + eps)
+
+
 def compute_feature_stats(snaps: list[SimSnapshot]) -> dict[str, tuple[float, float]]:
     """
     Compute global mean and std for each node feature across all snapshots.
     Returns a dict: feature_name → (mean, std).
     """
     features = {
-        "pos_x":        [],
-        "pos_y":        [],
-        "pos_z":        [],
-        "muv":          [],
-        "log_mass":     [],
-        "tigm":         [],
-        "ew_obs":       [],
-        "lya_obs_norm": [],
+        "pos_x":       [],
+        "pos_y":       [],
+        "pos_z":       [],
+        "muv":         [],
+        "log_mass":    [],
+        "tigm":        [],
+        "ew_obs":      [],
+        "lya_obs_log": [],   # log10(L_Lyα)
     }
     for s in snaps:
         features["pos_x"].append(s.pos[:, 0])
@@ -58,12 +101,9 @@ def compute_feature_stats(snaps: list[SimSnapshot]) -> dict[str, tuple[float, fl
         features["muv"].append(s.muv)
         features["log_mass"].append(np.log10(np.clip(s.halo_mass, 1e6, None)))
         features["tigm"].append(s.tigm)
-        # EW_obs: clip negative (unphysical) and log-normalise
         ew = np.clip(s.rew_obs, 0., 300.)
         features["ew_obs"].append(ew)
-        # Lya_obs normalised by box mean (per snapshot)
-        lya_mean = s.lya_obs.mean() + 1e-40
-        features["lya_obs_norm"].append(s.lya_obs / lya_mean)
+        features["lya_obs_log"].append(_log10_lya(s.lya_obs))
 
     stats = {}
     for k, arrs in features.items():
@@ -89,7 +129,7 @@ def build_node_features(
         4  log10(M_h) (standardised)
         5  T_IGM (standardised)
         6  EW_obs (standardised)
-        7  Lya_obs / <Lya_obs> (standardised)
+        7  log10(L_Lyα) (standardised)
     """
 
     def _norm(arr, key):
@@ -97,8 +137,7 @@ def build_node_features(
         return (arr - mu) / sigma
 
     box = snap.box_size
-    lya_mean = snap.lya_obs.mean() + 1e-40
-    ew = np.clip(snap.rew_obs, 0., 300.)
+    ew  = np.clip(snap.rew_obs, 0., 300.)
 
     feats = np.stack([
         snap.pos[:, 0] / box,
@@ -108,7 +147,7 @@ def build_node_features(
         _norm(np.log10(np.clip(snap.halo_mass, 1e6, None)), "log_mass"),
         _norm(snap.tigm, "tigm"),
         _norm(ew, "ew_obs"),
-        _norm(snap.lya_obs / lya_mean, "lya_obs_norm"),
+        _norm(_log10_lya(snap.lya_obs), "lya_obs_log"),
     ], axis=-1).astype(np.float32)  # (N, 8)
 
     return torch.from_numpy(feats).to(device)
@@ -119,52 +158,311 @@ def build_source_weights(
     device: str | torch.device = "cpu",
 ) -> torch.Tensor:
     """
-    Raw source weights w_i = L_i (observed Lyα, proxy for UV).
-    These are multiplied by f_esc (GNN output) inside the model.
-    Returns (N,) float32 tensor, normalised to unit mean.
+    Source weights w_i for the scatter step.
+
+    Uses log10(L_Lyα) as the weight so the enormous dynamic range of
+    luminosities doesn't cause float32 overflow.
+
+    Pipeline:
+        log_L  = log10(L_Lyα + eps)         [float64, avoids log(0)]
+        w      = log_L − min(log_L)          [shift to ≥ 0]
+        w      = w / mean(w)                 [unit mean]
+        cast to float32
     """
-    w = snap.lya_obs.astype(np.float32)
-    w = w / (w.mean() + 1e-40)
+    log_lya = _log10_lya(snap.lya_obs)
+    log_lya = log_lya - log_lya.min()
+    norm    = float(log_lya.mean()) + 1e-8
+    w       = (log_lya / norm).astype(np.float32)
     return torch.from_numpy(w).to(device)
 
 
 # ------------------------------------------------------------------ #
-#  Density basis fields for unresolved sources
+#  HOD calibration
 # ------------------------------------------------------------------ #
 
-def build_density_basis(
-    snap: SimSnapshot,
-    grid_size: int = 64,
-    n_populations: int = 3,
-    device: str | torch.device = "cpu",
-) -> torch.Tensor:
+@dataclass
+class HODCalibration:
     """
-    Build n_populations density-bias basis fields on a (grid_size)^3 grid.
+    Pre-computed HOD basis fields for the unresolved faint-source emissivity.
 
-    For simplicity in the MVP, uses the DM density field raised to powers
-    {0.5, 1.0, 2.0}, representing diffuse / linear / clustered populations.
+    This is the shared interface between the simulation and observation paths.
+    The same HODUnresolvedField model operates identically in both cases;
+    only the basis_fields array changes.
 
-    Returns: (n_populations, grid_size, grid_size, grid_size) float32 tensor.
+    Attributes
+    ----------
+    basis_fields : (n_bins, G, G, G) float32
+        HOD basis fields ε_b(x) = (1 + b_b δ(x)), unit mean per bin.
+        Fixed during training — only f_esc_b is learned.
+    bin_labels : list[str]
+        Human-readable labels for each bin (e.g. "MUV(-17.5,-16.5]").
+    hod_params : dict
+        Measured / fitted parameters for logging:
+            "bias"         : [float, ...] linear bias per bin
+            "n_bar"        : [float, ...] mean halo count per voxel
+            "mean_log_lum" : [float, ...] mean log10(L_Lyα) per bin
+            "N_halos"      : [int, ...]   number of halos in each bin
+    source : str
+        "simulation" | "observations"
     """
-    if snap.dbox_512 is None:
-        # Fall back: uniform density
-        unity = torch.ones(n_populations, grid_size, grid_size, grid_size,
-                           device=device, dtype=torch.float32)
-        return unity / unity.sum(dim=0, keepdim=True).clamp(min=1e-8)
+    basis_fields : np.ndarray          # (n_bins, G, G, G)
+    bin_labels   : list[str]
+    hod_params   : dict
+    source       : str = "simulation"
 
-    # Downsample density to working resolution
-    rho = downsample_grid(snap.dbox_512, target=grid_size)
-    rho = np.clip(rho, 0.0, None) + 1e-4   # ensure positive
 
-    # Power-law bias models
-    powers = np.linspace(0.5, 2.0, n_populations)
-    basis = np.stack([rho ** p for p in powers], axis=0)  # (P, G, G, G)
+def _scatter_count_to_grid(
+    pos     : np.ndarray,   # (N, 3) in cMpc/h
+    box_size: float,
+    G       : int,
+) -> np.ndarray:
+    """
+    Trilinear scatter of N halos (uniform weight = 1) onto a G³ grid.
+    Returns (G, G, G) float64 = halo number density per voxel.
 
-    # Normalise each basis field to unit mean
-    for b in range(n_populations):
-        basis[b] /= basis[b].mean() + 1e-8
+    Vectorised: 8 np.add.at calls, each over N halos.  O(8N) time.
+    """
+    pos_norm = np.clip(pos / box_size, 0.0, 1.0 - 1e-6)
+    pix      = pos_norm * G
+    i0       = pix.astype(int)
+    i1       = (i0 + 1) % G
+    frac     = pix - i0.astype(float)
+    f0, f1   = 1.0 - frac, frac
 
-    return torch.from_numpy(basis.astype(np.float32)).to(device)
+    flat = np.zeros(G * G * G, dtype=np.float64)
+    for bx, wx in ((i0[:, 0], f0[:, 0]), (i1[:, 0], f1[:, 0])):
+        for by, wy in ((i0[:, 1], f0[:, 1]), (i1[:, 1], f1[:, 1])):
+            for bz, wz in ((i0[:, 2], f0[:, 2]), (i1[:, 2], f1[:, 2])):
+                idx = (bx % G) * G * G + (by % G) * G + (bz % G)
+                np.add.at(flat, idx, wx * wy * wz)
+    return flat.reshape(G, G, G)
+
+
+def build_hod_basis_from_simulation(
+    snap         : SimSnapshot,
+    muv_det      : float = -17.5,
+    muv_bin_edges: list[float] | None = None,
+    grid_size    : int = 64,
+) -> HODCalibration:
+    """
+    Calibrate HOD basis fields directly from the simulation's halo catalog.
+
+    Algorithm
+    ---------
+    For each faint halo mass bin b  (M_UV > muv_det):
+      1. Scatter halos to a G³ grid (uniform weight → number density field n_b(x))
+      2. Measure linear bias:  b_b = Cov(n_b, δ_dm) / Var(δ_dm)
+      3. Build linear bias field:  ε_b(x) = 1 + b_b · δ(x)
+      4. Clip to ≥ 0 (no negative emissivity) and normalise to unit mean
+
+    This is model-free: no HMF assumption, no analytical bias model.
+    The same ε_b(x) structure — a linear bias field — would be constructed
+    from observational HOD fitting, making the model transferable.
+
+    Parameters
+    ----------
+    snap          : SimSnapshot with full halo catalog (including faint halos)
+    muv_det       : M_UV detection threshold; halos with M_UV > muv_det are
+                    "unresolved" (not detected). Fainter = more positive M_UV.
+    muv_bin_edges : M_UV bin edges for the faint population. Default:
+                    [-17.5, -16.5, -15.0] → 3 bins:
+                      bin 0 (-17.5, -16.5]: near-threshold, brightest unresolved
+                      bin 1 (-16.5, -15.0]: intermediate
+                      bin 2 (-15.0, +∞)  : faintest
+    grid_size     : output grid resolution G (default 64)
+
+    Returns
+    -------
+    HODCalibration with basis_fields (n_bins, G, G, G)
+    """
+    if muv_bin_edges is None:
+        muv_bin_edges = [-17.5, -16.5, -15.0]
+
+    G = grid_size
+
+    # ── DM density contrast ──────────────────────────────────────────
+    if snap.dbox_512 is not None:
+        rho   = downsample_grid(snap.dbox_512, target=G).astype(np.float64)
+        rho   = np.clip(rho, 0.0, None) + 1e-4
+        delta = rho / rho.mean() - 1.0
+    else:
+        delta = np.zeros((G, G, G), dtype=np.float64)
+
+    var_delta = float(np.var(delta))
+
+    # ── Faint halos: M_UV > muv_det ──────────────────────────────────
+    mask_faint = snap.muv > muv_det
+    pos_faint  = snap.pos[mask_faint]           # (N_faint, 3) cMpc/h
+    muv_faint  = snap.muv[mask_faint]
+    lya_faint  = snap.lya_obs[mask_faint]
+
+    # ── Per-bin processing ────────────────────────────────────────────
+    n_bins      = len(muv_bin_edges)            # last bin is open-ended
+    basis_list  = []
+    bin_labels  = []
+    hod_n_bar, hod_bias, hod_mean_lum, hod_n_halos = [], [], [], []
+
+    for b in range(n_bins):
+        lo = muv_bin_edges[b]
+        hi = muv_bin_edges[b + 1] if b + 1 < n_bins else np.inf
+
+        if np.isinf(hi):
+            mask_bin = muv_faint > lo
+            label    = f"MUV>{lo:.1f}"
+        else:
+            mask_bin = (muv_faint > lo) & (muv_faint <= hi)
+            label    = f"MUV({lo:.1f},{hi:.1f}]"
+
+        bin_labels.append(label)
+        N_bin = int(mask_bin.sum())
+        hod_n_halos.append(N_bin)
+
+        if N_bin < 8:
+            # Too few halos: fall back to uniform (no spatial variation)
+            basis    = np.ones((G, G, G), dtype=np.float32)
+            n_bar_b  = 0.0
+            bias_b   = 0.0
+            mean_lum = 0.0
+        else:
+            # Number density field (uniform halo weights)
+            n_grid = _scatter_count_to_grid(pos_faint[mask_bin], snap.box_size, G)
+            n_bar_b = float(n_grid.mean())
+
+            # Mean log10(L_Lyα) for amplitude reference (logging only)
+            mean_lum = float(_log10_lya(lya_faint[mask_bin]).mean())
+
+            # Linear bias from cross-correlation:  b = Cov(n, δ) / Var(δ)
+            if var_delta > 1e-8:
+                cov_nd = float(np.mean((n_grid - n_grid.mean()) * delta))
+                bias_b = float(np.clip(cov_nd / var_delta, 0.0, 20.0))
+            else:
+                bias_b = 0.0
+
+            # Linear bias field: 1 + b_b · δ(x)
+            basis = (1.0 + bias_b * delta).astype(np.float32)
+            basis = np.clip(basis, 0.0, None)   # no negative emissivity
+
+        # Normalise to unit mean so f_esc absorbs the amplitude
+        bmean = float(basis.mean())
+        if bmean > 1e-10:
+            basis = basis / bmean
+
+        basis_list.append(basis)
+        hod_n_bar.append(n_bar_b)
+        hod_bias.append(bias_b)
+        hod_mean_lum.append(mean_lum)
+
+    return HODCalibration(
+        basis_fields = np.stack(basis_list, axis=0).astype(np.float32),
+        bin_labels   = bin_labels,
+        hod_params   = {
+            "bias":         hod_bias,
+            "n_bar":        hod_n_bar,
+            "mean_log_lum": hod_mean_lum,
+            "N_halos":      hod_n_halos,
+        },
+        source = "simulation",
+    )
+
+
+def build_hod_basis_from_observations(
+    hod_params_per_bin : list[dict],
+    delta_proxy        : np.ndarray,
+    bin_labels         : list[str] | None = None,
+    grid_size          : int = 64,
+) -> HODCalibration:
+    """
+    Build HOD basis fields from observationally-fitted HOD parameters.
+
+    This is the real-data path, producing the same HODCalibration structure
+    as the simulation path so HODUnresolvedField works without modification.
+
+    Parameters
+    ----------
+    hod_params_per_bin : list of dicts, one per mass bin.
+        Required key per dict:
+            "bias"  : float — linear galaxy bias, from ACF fitting
+                      (or Tinker bias model evaluated at the bin's mean mass)
+        Optional keys (used for logging only):
+            "n_bar"        : float — mean number density (cMpc/h)^-3
+                             from HMF + HOD integral
+            "mean_log_lum" : float — mean log10(L_Lyα) from abundance matching
+            "label"        : str   — bin name
+
+    delta_proxy : (G, G, G) or any-resolution ndarray
+        Density contrast field proxy. Options for real observations:
+          - Smoothed LAE density field / b_LAE  (bias-corrected galaxy density)
+          - Weak-lensing convergence κ map
+          - DM field from N-body (for mock tests)
+        Resampled to grid_size if needed.
+
+    bin_labels : optional list of label strings (overrides "label" keys)
+    grid_size  : output grid resolution G
+
+    Returns
+    -------
+    HODCalibration with source="observations"
+
+    Example — applying model to real COSMOS-3D data
+    ------------------------------------------------
+    From the ACF of detected LAEs fit HOD parameters (M_min, σ, M_1, α).
+    Extrapolate HOD to faint end (M_UV > -17.5) to get n_bar and bias per bin.
+    Build a density proxy from the LAE density field (smoothed, bias-corrected).
+
+        params = [
+            {"bias": 4.2, "n_bar": 3e-4, "mean_log_lum": 40.1, "label": "near_thresh"},
+            {"bias": 2.8, "n_bar": 8e-4, "mean_log_lum": 39.5, "label": "intermediate"},
+            {"bias": 1.9, "n_bar": 2e-3, "mean_log_lum": 38.8, "label": "faint"},
+        ]
+        delta_proxy = (lae_density / lae_density.mean() - 1) / b_LAE
+        hod = build_hod_basis_from_observations(params, delta_proxy)
+    """
+    G = grid_size
+    n_bins = len(hod_params_per_bin)
+
+    # Resample proxy if needed
+    if delta_proxy.shape[0] != G:
+        delta_proxy = downsample_grid(delta_proxy, target=G)
+    delta_proxy = delta_proxy.astype(np.float64)
+
+    basis_list  = []
+    labels_out  = []
+    n_bar_list, bias_list, lum_list = [], [], []
+
+    for b, params in enumerate(hod_params_per_bin):
+        bias_b   = float(params["bias"])
+        n_bar_b  = float(params.get("n_bar", 0.0))
+        mean_lum = float(params.get("mean_log_lum", 0.0))
+        # Label priority: explicit param "label" > bin_labels arg > default
+        label = params.get("label",
+                           bin_labels[b] if bin_labels and b < len(bin_labels)
+                           else f"bin{b}")
+
+        # Linear bias field: 1 + b_b · δ_proxy(x)
+        basis = (1.0 + bias_b * delta_proxy).astype(np.float32)
+        basis = np.clip(basis, 0.0, None)
+
+        # Normalise to unit mean
+        bmean = float(basis.mean())
+        if bmean > 1e-10:
+            basis = basis / bmean
+
+        basis_list.append(basis)
+        labels_out.append(label)
+        n_bar_list.append(n_bar_b)
+        bias_list.append(bias_b)
+        lum_list.append(mean_lum)
+
+    return HODCalibration(
+        basis_fields = np.stack(basis_list, axis=0).astype(np.float32),
+        bin_labels   = labels_out,
+        hod_params   = {
+            "bias":         bias_list,
+            "n_bar":        n_bar_list,
+            "mean_log_lum": lum_list,
+        },
+        source = "observations",
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -172,33 +470,58 @@ def build_density_basis(
 # ------------------------------------------------------------------ #
 
 def prepare_snapshot(
-    snap: SimSnapshot,
-    stats: dict[str, tuple[float, float]],
-    grid_size: int = 64,
-    n_populations: int = 3,
-    device: str | torch.device = "cpu",
+    snap            : SimSnapshot,
+    stats           : dict[str, tuple[float, float]],
+    grid_size       : int = 64,
+    n_populations   : int = 3,          # kept for API compat; used as n_hod_bins
+    muv_det         : float = -17.5,
+    muv_bin_edges   : list[float] | None = None,
+    hod_calibration : HODCalibration | None = None,
+    device          : str | torch.device = "cpu",
 ) -> dict:
     """
-    Returns a dict with all tensors needed for one forward pass:
-        pos:          (N, 3) normalised to [0, 1]
-        node_feats:   (N, 8) standardised features
-        src_weights:  (N,) source weights (Lya_obs normalised)
-        xbox_true:    (1, 1, G, G, G) downsampled ground-truth ionization
-        density_basis:(P, G, G, G) bias basis fields
-        xi_global:    float, global ionized fraction
-        z:            float, redshift
+    Returns a dict with all tensors needed for one forward pass.
+
+    If hod_calibration is None, it is computed from the simulation snapshot via
+    build_hod_basis_from_simulation().  Pass a pre-computed HODCalibration to
+    avoid recomputing across training epochs (the basis is fixed and identical
+    for all epochs of the same snapshot).
+
+    Dict keys
+    ---------
+    pos            : (N, 3) normalised positions [0, 1]
+    pos_raw        : (N, 3) cMpc/h
+    node_feats     : (N, 8) standardised node features
+    src_weights    : (N,) log10(L_Lyα) source weights
+    xbox_true      : (1, 1, G, G, G) ground-truth ionization field
+    hod_basis      : (n_bins, G, G, G) HOD basis fields (fixed, pre-computed)
+    hod_calibration: HODCalibration object (for logging / inspection)
+    xi_global      : float, global ionized fraction
+    z              : float, redshift
+    box_size       : float, cMpc/h
+    grid_size      : int
     """
-    xbox_ds = downsample_grid(snap.xbox_512, target=grid_size)
+    if hod_calibration is None:
+        hod_calibration = build_hod_basis_from_simulation(
+            snap,
+            muv_det       = muv_det,
+            muv_bin_edges = muv_bin_edges,
+            grid_size     = grid_size,
+        )
+
+    xbox_ds    = downsample_grid(snap.xbox_512, target=grid_size)
+    hod_basis_t = torch.from_numpy(hod_calibration.basis_fields).to(device)
 
     return {
-        "pos":           torch.from_numpy((snap.pos / snap.box_size).astype(np.float32)).to(device),
-        "pos_raw":       torch.from_numpy(snap.pos.astype(np.float32)).to(device),  # cMpc/h
-        "node_feats":    build_node_features(snap, stats, device),
-        "src_weights":   build_source_weights(snap, device),
-        "xbox_true":     grid_to_tensor(xbox_ds, device),
-        "density_basis": build_density_basis(snap, grid_size, n_populations, device),
-        "xi_global":     snap.xi_global,
-        "z":             snap.redshift,
-        "box_size":      snap.box_size,
-        "grid_size":     grid_size,
+        "pos":             torch.from_numpy((snap.pos / snap.box_size).astype(np.float32)).to(device),
+        "pos_raw":         torch.from_numpy(snap.pos.astype(np.float32)).to(device),
+        "node_feats":      build_node_features(snap, stats, device),
+        "src_weights":     build_source_weights(snap, device),
+        "xbox_true":       grid_to_tensor(xbox_ds, device),
+        "hod_basis":       hod_basis_t,           # (n_bins, G, G, G)
+        "hod_calibration": hod_calibration,        # for logging
+        "xi_global":       snap.xi_global,
+        "z":               snap.redshift,
+        "box_size":        snap.box_size,
+        "grid_size":       grid_size,
     }

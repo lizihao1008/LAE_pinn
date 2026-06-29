@@ -20,7 +20,7 @@ Returns a SimSnapshot dataclass with everything needed downstream.
 
 from __future__ import annotations
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -32,10 +32,6 @@ SNAPSHOT_DIRS = {
     6.6:   "Fiducial_z_6.6",
     5.756: "Fiducial_z_5.756",
 }
-
-# True mean ionized fractions from METHODS.md
-X_HI_TRUE = {7.14: 0.69, 6.6: 0.52, 5.756: 0.13}
-
 
 @dataclass
 class SimSnapshot:
@@ -61,11 +57,7 @@ class SimSnapshot:
     xbox_512: np.ndarray                # (512,512,512) ionization fraction
     dbox_512: Optional[np.ndarray]      # (512,512,512) density contrast
 
-    # Global quantities
-    x_hi_true: float = field(init=False)
-
-    def __post_init__(self):
-        self.x_hi_true = X_HI_TRUE.get(self.redshift, 1.0 - float(self.xbox_512.mean()))
+    # Global quantities (computed from xbox_512 in properties below)
 
     @property
     def n_halos(self) -> int:
@@ -73,8 +65,13 @@ class SimSnapshot:
 
     @property
     def xi_global(self) -> float:
-        """Global ionized fraction from grid."""
+        """Global ionized fraction ⟨x_i⟩ from grid."""
         return float(self.xbox_512.mean())
+
+    @property
+    def x_hi(self) -> float:
+        """Global neutral hydrogen fraction ⟨x_HI⟩ = 1 − ⟨x_i⟩."""
+        return 1.0 - self.xi_global
 
     def filter_by_muv(self, muv_cut: float) -> "SimSnapshot":
         """Return a new snapshot with halos brighter than muv_cut."""
@@ -141,6 +138,10 @@ def load_snapshot(
     rew_obs  = _load("Observed_REW.npy")           # (N,)
     pec_vel  = _load("Peculiar_velocity_halo.npy") # (N, 3)
     xbox     = _load("Xbox_grid_017_512.npy")      # (512,512,512)
+
+    # Luminosities: clip negative values (numerical noise from RT output)
+    lya_int = np.clip(lya_int, 0.0, None)
+    lya_obs = np.clip(lya_obs, 0.0, None)
 
     # TIGM: avoid divide-by-zero
     tigm = np.where(lya_int > 0, lya_obs / lya_int, 0.0)
@@ -221,6 +222,6 @@ if __name__ == "__main__":
     snaps = load_all_snapshots(sim_root)
     for z, s in snaps.items():
         print(f"z={z}: {s.n_halos} halos, xi_global={s.xi_global:.3f}, "
-              f"x_HI_true={s.x_hi_true:.2f}")
+              f"x_HI={s.x_hi:.2f}")
         lae = s.filter_by_muv(-17.5)
         print(f"  observed LAEs (MUV<-17.5): {lae.n_halos}")

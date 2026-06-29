@@ -74,7 +74,7 @@ def run_stress_test(name: str, cfg_st: dict, args, device: torch.device) -> dict
 
     model = LAEPINN(
         gnn_in_channels=8, gnn_hidden_dim=32, gnn_out_channels=16,
-        gnn_n_layers=3, gnn_heads=2, n_populations=3,
+        gnn_n_layers=3, gnn_heads=2, n_hod_bins=3,
         grid_size=args.grid, box_size=snap.box_size,
     )
 
@@ -99,8 +99,7 @@ def run_stress_test(name: str, cfg_st: dict, args, device: torch.device) -> dict
 
     model.eval()
     with torch.no_grad():
-        out = model(test_graph.to(device), test_graph.density_basis,
-                    xi_global=test_graph.xi_global)
+        out = model(test_graph.to(device), hod_basis=test_graph.hod_basis)
 
     x_pred = out["x_hii_pred"].cpu().numpy()
     x_true = test_graph.xbox_true.squeeze().cpu().numpy()

@@ -205,12 +205,13 @@ def make_3d_kernel_grid(
     cx, cy, cz = torch.meshgrid(coords, coords, coords, indexing="ij")
     r3d = (cx ** 2 + cy ** 2 + cz ** 2).sqrt()  # (G, G, G)
 
-    with torch.no_grad():
-        k3d = kernel(r3d)           # (G, G, G)
+    # Evaluate kernel WITHOUT torch.no_grad() so that gradients flow back
+    # through K_fft → J_fft → loss to the kernel parameters (R, Δ, λ).
+    k3d = kernel(r3d)               # (G, G, G)
 
     # Roll so that zero-lag is at (0,0,0) — required for FFT convolution
     k3d = torch.roll(k3d, shifts=(G // 2, G // 2, G // 2), dims=(0, 1, 2))
 
-    # Normalise to unit sum
+    # Normalise to unit sum; contiguous for FFT (roll leaves non-contiguous storage)
     k3d = k3d / (k3d.sum() + 1e-12)
-    return k3d                        # (G, G, G)
+    return k3d.contiguous()               # (G, G, G)

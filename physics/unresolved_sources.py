@@ -1,93 +1,131 @@
 """
 physics/unresolved_sources.py
-Constrained unresolved faint-source emissivity field.
+HOD-based unresolved faint-source emissivity field.
 
-ε_unres(x) = Σ_b F_b · ε_b(x)
+Physical model
+--------------
+    ε_unres(x) = Σ_b  f_esc_b · ε_b(x)
 
-Constraints:
-    F_b ≥ 0,  Σ_b F_b = 1   (enforced via softmax)
-    ε_b(x) ≥ 0              (enforced via basis field construction)
-    ε_b(x) smooth           (prior on density power-law basis)
+where
+    ε_b(x)   — HOD basis field (fixed, pre-computed before training)
+                ε_b(x) = (1 + b_b · δ_dm(x)),  normalised to unit mean.
+                Encodes the spatial clustering of faint halos in mass bin b.
+    f_esc_b  — ONLY learnable parameter: escape fraction for mass bin b.
 
-This is NOT a free neural field. The basis fields ε_b(x) are computed from
-the dark matter density field with fixed functional form (power-law bias)
-and optional luminosity-function / halo-mass-function priors on F_b.
+Why this is better than ρ^α_b power-law mixing
+-----------------------------------------------
+    ρ^α_b is an arbitrary polynomial in density with no physical interpretation.
+    The HOD approach separates what is physically known (spatial distribution,
+    set by dark-matter clustering + HOD) from what is physically unknown
+    (escape fractions, learned from the ionization field).
+
+Interface
+---------
+    Basis fields are calibrated once before training by
+    data.preprocessing.build_hod_basis_from_simulation()   (simulation path)
+    data.preprocessing.build_hod_basis_from_observations() (real-data path)
+    Both return a HODCalibration object whose .basis_fields tensor is passed
+    to forward().  The model is identical in both cases; only the basis changes.
 """
 
 from __future__ import annotations
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-class UnresolvedSourceField(nn.Module):
+class HODUnresolvedField(nn.Module):
     """
-    Learnable constrained unresolved emissivity field.
+    HOD-based unresolved faint-source emissivity.
 
     Parameters
     ----------
-    n_populations : int
-        Number of source populations (e.g. bright / faint / diffuse = 3).
-    lf_prior : torch.Tensor or None
-        (n_populations,) prior fractions from luminosity function integral.
-        If provided, KL divergence to this prior is added to the loss.
+    n_bins : int
+        Number of halo-mass / M_UV bins for faint sources (default 3).
+
+    Learnable parameters
+    --------------------
+    _logit_fesc : (n_bins,)
+        Logit-space escape fractions; f_esc_b = sigmoid(_logit_fesc_b) ∈ (0, 1).
+        Initialised at 0 → f_esc ≈ 0.5 (agnostic prior).
+
+    Fixed inputs (passed at each forward call)
+    ------------------------------------------
+    hod_basis : (n_bins, G, G, G)
+        Pre-computed HOD basis fields, one per mass bin.
+        Computed from build_hod_basis_from_simulation() or
+        build_hod_basis_from_observations() and attached to the graph object.
+        NOT registered as a buffer; passed explicitly so the same model
+        checkpoint works with different calibrations (simulation vs. observations).
     """
 
-    def __init__(
-        self,
-        n_populations: int = 3,
-        lf_prior: torch.Tensor | None = None,
-    ):
+    def __init__(self, n_bins: int = 3):
         super().__init__()
-        self.n_populations = n_populations
+        self.n_bins = n_bins
+        # Initialise at logit(0.5) = 0 → f_esc = 0.5 at start
+        self._logit_fesc = nn.Parameter(torch.zeros(n_bins))
 
-        # Learnable logits for F_b (softmax → constrained fractions)
-        # Initialised to uniform
-        self._F_logits = nn.Parameter(torch.zeros(n_populations))
+    # ------------------------------------------------------------------ #
+    #  Properties
+    # ------------------------------------------------------------------ #
 
-        # Optional prior fractions (not learned)
-        if lf_prior is not None:
-            self.register_buffer("lf_prior", lf_prior.float())
-        else:
-            self.register_buffer("lf_prior", None)
+    @property
+    def f_esc_bins(self) -> torch.Tensor:
+        """(n_bins,) escape fractions ∈ (0, 1) for each mass bin."""
+        return torch.sigmoid(self._logit_fesc)
 
     @property
     def F_b(self) -> torch.Tensor:
-        """(n_populations,) source-budget fractions, sum=1, ≥0."""
-        return F.softmax(self._F_logits, dim=0)
+        """Alias for f_esc_bins (backward-compat with old UnresolvedSourceField)."""
+        return self.f_esc_bins
 
-    def forward(self, density_basis: torch.Tensor) -> torch.Tensor:
+    # ------------------------------------------------------------------ #
+    #  Forward
+    # ------------------------------------------------------------------ #
+
+    def forward(self, hod_basis: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
-        density_basis : (n_populations, G, G, G)
-            Pre-built density-bias basis fields (from preprocessing.py).
-            Each is ≥ 0 and normalised to unit mean.
+        hod_basis : (n_bins, G, G, G)
+            Pre-computed HOD basis fields, fixed during training.
 
         Returns
         -------
         eps_unres : (G, G, G)
-            Unresolved emissivity field, weighted sum of basis fields.
+            Unresolved emissivity field: weighted sum Σ_b f_esc_b · ε_b(x).
         """
-        # F_b: (P,), density_basis: (P, G, G, G)
-        fb = self.F_b  # (P,)
-        # Weighted sum: Σ_b F_b · ε_b(x)
-        eps_unres = torch.einsum("p,pghw->ghw", fb, density_basis)
-        return eps_unres   # (G, G, G), ≥0 by construction
+        # f_esc_bins: (B,)   hod_basis: (B, G, G, G)
+        return torch.einsum("b,bxyz->xyz", self.f_esc_bins, hod_basis)
+
+    # ------------------------------------------------------------------ #
+    #  Loss helpers
+    # ------------------------------------------------------------------ #
 
     def lf_kl_loss(self) -> torch.Tensor:
         """
-        KL divergence from learned F_b to luminosity-function prior.
-        Returns scalar tensor (0 if no prior provided).
+        No analytical prior on escape fractions — returns zero.
+        Kept for API compatibility with loss.py (which calls lf_kl_loss()).
+        A physics-motivated prior on f_esc(M) can be added here later
+        (e.g., f_esc decreasing with halo mass from simulations).
         """
-        if self.lf_prior is None:
-            return torch.tensor(0.0, device=self._F_logits.device)
-        # KL(F_b || lf_prior)
-        fb = self.F_b.clamp(min=1e-8)
-        prior = self.lf_prior.clamp(min=1e-8)
-        return (fb * (fb.log() - prior.log())).sum()
+        return torch.tensor(0.0, device=self._logit_fesc.device)
+
+    # ------------------------------------------------------------------ #
+    #  Logging helpers
+    # ------------------------------------------------------------------ #
+
+    def get_fesc_dict(self, labels: list[str] | None = None) -> dict[str, float]:
+        """Return {label: f_esc_val} dict for logging."""
+        fesc = self.f_esc_bins.detach().cpu()
+        default_labels = [f"fesc_bin{b}" for b in range(self.n_bins)]
+        labs = labels if labels is not None else default_labels
+        return {labs[b]: float(fesc[b]) for b in range(self.n_bins)}
 
     def get_fractions(self) -> dict[str, float]:
-        fb = self.F_b.detach().cpu()
-        labels = ["bright", "faint", "diffuse", "pop4"]
-        return {labels[i]: float(fb[i]) for i in range(self.n_populations)}
+        """Alias for get_fesc_dict() (backward-compat with old UnresolvedSourceField)."""
+        return self.get_fesc_dict()
+
+    def extra_repr(self) -> str:
+        fesc = self.f_esc_bins.detach().cpu().tolist()
+        vals = ", ".join(f"{v:.3f}" for v in fesc)
+        return f"n_bins={self.n_bins}, f_esc=[{vals}]"

@@ -1,116 +1,126 @@
 """
 physics/excursion_set.py
-Soft excursion-set mapping: total ionizing flux J(x) → x_HII(x).
+Photoionization-equilibrium mapping: J(x) → x_HII(x).
 
-Physics motivation:
-    The excursion-set formalism maps ionizing photon budget above a threshold
-    (recombination rate) to ionized regions.  Here we implement a differentiable
-    soft version: a sigmoid with learnable threshold and sharpness.
+    A ≡ Γ_HI / (α n_H)  ∝  J / s        (s: single learnable α·n_H scale)
+    x_HII = (√(A² + 4A) - A) / 2
 
-    x_HII(x) = σ( (J(x) - μ_thresh) / τ )
-
-    with a global normalisation constraint:
-        mean(x_HII) ≈ ξ_global = ⟨x_i⟩_z
-
-The threshold μ_thresh and sharpness τ are learnable (or can be fixed for ablation).
+    J = 0  ⟹  x_HII = 0
 """
 
 from __future__ import annotations
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+def equilibrium_x_hii(A: torch.Tensor) -> torch.Tensor:
+    """Ionized fraction from A = Γ_HI/(α n_H); exact solution of A(1-x)=x²."""
+    A = A.clamp(min=0.0)
+    return (torch.sqrt(A * A + 4.0 * A + 1e-12) - A) * 0.5
+
+
+def equilibrium_x_hi(A: torch.Tensor) -> torch.Tensor:
+    """Neutral fraction x_HI = 1 - x_HII (same quadratic equilibrium)."""
+    A = A.clamp(min=0.0)
+    return (2.0 + A - torch.sqrt(A * A + 4.0 * A + 1e-12)) * 0.5
+
+
 class ExcursionSetMapping(nn.Module):
     """
-    Differentiable photon-budget → ionization mapping.
+    J → x_HII via photoionization equilibrium.
 
-    Parameters
-    ----------
-    threshold_init : float
-        Initial value of the excursion-set threshold (before softplus).
-    sharpness_init : float
-        Initial value of τ (sharpness), constrained > 0 via softplus.
-    learnable : bool
-        If False, threshold and sharpness are fixed (for ablation).
+    One learnable scale s > 0 absorbs α(T)·⟨n_H⟩ and J unit conversion.
+    Optional gain g (binary search, no grad) enforces ⟨x_HII⟩ = ξ_global.
     """
 
     def __init__(
         self,
-        threshold_init: float = 0.0,
-        sharpness_init: float = 1.0,
+        alpha_nH_scale_init: float = 1.0,
         learnable: bool = True,
+        # deprecated aliases
+        alpha_scale_init: float | None = None,
+        J_scale_init: float | None = None,
+        sharpness_init: float | None = None,
+        threshold_init: float | None = None,
     ):
         super().__init__()
+        init = alpha_nH_scale_init
+        if alpha_scale_init is not None:
+            init = alpha_scale_init
+        if J_scale_init is not None:
+            init = J_scale_init
+        if sharpness_init is not None:
+            init = sharpness_init
+        _ = threshold_init
+
+        raw = math.log(math.expm1(max(init, 1e-6)))
         if learnable:
-            self._thresh_raw   = nn.Parameter(torch.tensor(threshold_init))
-            self._sharp_raw    = nn.Parameter(torch.tensor(
-                torch.log(torch.expm1(torch.tensor(sharpness_init))).item()
-            ))
+            # s ≡ α(T)·⟨n_H⟩ (effective); n_H not observed, folded into this scalar
+            self._scale_raw = nn.Parameter(torch.tensor(raw, dtype=torch.float32))
         else:
-            self.register_buffer("_thresh_raw", torch.tensor(threshold_init))
-            self.register_buffer("_sharp_raw",  torch.tensor(
-                torch.log(torch.expm1(torch.tensor(sharpness_init))).item()
-            ))
+            self.register_buffer("_scale_raw", torch.tensor(raw, dtype=torch.float32))
 
     @property
-    def threshold(self) -> torch.Tensor:
-        return self._thresh_raw    # unconstrained; centre of sigmoid
+    def alpha_nH_scale(self) -> torch.Tensor:
+        return F.softplus(self._scale_raw) + 1e-8
+
+    # backward-compatible aliases
+    @property
+    def alpha_scale(self) -> torch.Tensor:
+        return self.alpha_nH_scale
 
     @property
-    def sharpness(self) -> torch.Tensor:
-        return F.softplus(self._sharp_raw)   # τ > 0
+    def J_scale(self) -> torch.Tensor:
+        return self.alpha_nH_scale
 
     def forward(
         self,
-        J_total: torch.Tensor,              # (G, G, G) total ionizing flux
-        xi_global: float | None = None,     # target global ionized fraction
+        J_total: torch.Tensor,
+        xi_global: float | None = None,
+        n_H: torch.Tensor | None = None,  # ignored; kept for call-site compat
     ) -> torch.Tensor:
-        """
-        Maps J_total → x_HII field in [0, 1].
-
-        If xi_global is provided, the threshold is shifted so that the
-        global mean of x_HII matches xi_global (global constraint).
-        This is applied as a calibration step (not gradient-based),
-        complemented by a loss term in training.
-        """
-        tau = self.sharpness
-        x_hii = torch.sigmoid((J_total - self.threshold) / tau)   # (G, G, G)
+        _ = n_H  # n_H not used: α and ⟨n_H⟩ merged into alpha_nH_scale
+        J = J_total.clamp(min=0.0)  # flux ≥ 0  →  x_HII(0)=0 by construction
+        scale = self.alpha_nH_scale
+        # A = J/s;  x_HII = (√(A²+4A)−A)/2
+        x_hii = equilibrium_x_hii(J / scale)
 
         if xi_global is not None:
-            # Calibrate threshold so mean(x_HII) = xi_global
-            # Use binary search on the threshold shift (no-gradient step)
+            # Global constraint: find g so ⟨x_HII⟩ matches target ξ (no gradient)
             with torch.no_grad():
-                xi_global_t = torch.tensor(xi_global, dtype=J_total.dtype,
-                                           device=J_total.device)
-                # Compute current mean
-                delta = self._calibrate_shift(J_total, xi_global_t, tau)
-            x_hii = torch.sigmoid((J_total - self.threshold - delta) / tau)
+                xi_t = torch.tensor(xi_global, dtype=J.dtype, device=J.device)
+                gain = self._calibrate_gain(J, scale, xi_t)
+            x_hii = equilibrium_x_hii(gain * J / scale)
 
-        return x_hii    # (G, G, G), ∈ [0, 1]
+        return x_hii
 
     @staticmethod
-    def _calibrate_shift(
+    def _calibrate_gain(
         J: torch.Tensor,
+        scale: torch.Tensor,
         xi_target: torch.Tensor,
-        tau: torch.Tensor,
-        n_iter: int = 30,
+        n_iter: int = 40,
     ) -> torch.Tensor:
-        """
-        Binary search for the threshold shift δ such that
-        mean(σ((J - δ) / τ)) = xi_target.
-        """
-        lo = J.min() - 10 * tau
-        hi = J.max() + 10 * tau
+        # Monotone in g: g=0 → all neutral; large g → saturated ionization
+        lo = torch.zeros((), device=J.device, dtype=J.dtype)
+        hi = torch.ones((), device=J.device, dtype=J.dtype)
+
+        for _ in range(24):
+            if equilibrium_x_hii(hi * J / scale).mean() >= xi_target:
+                break
+            hi = hi * 2.0
+        hi = hi.clamp(max=1e6)
+
         for _ in range(n_iter):
             mid = (lo + hi) / 2
-            val = torch.sigmoid((J - mid) / tau).mean()
+            val = equilibrium_x_hii(mid * J / scale).mean()
             if val > xi_target:
-                lo = mid
-            else:
                 hi = mid
+            else:
+                lo = mid
         return (lo + hi) / 2
 
-    def extra_repr(self):
-        return (f"threshold={self.threshold.item():.3f}, "
-                f"sharpness={self.sharpness.item():.3f}")
+    def extra_repr(self) -> str:
+        return f"alpha_nH_scale={self.alpha_nH_scale.item():.4f}"

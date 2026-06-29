@@ -49,21 +49,29 @@ def scatter_to_grid(
     f0 = 1.0 - frac             # (N, 3)
     f1 = frac
 
-    grid = torch.zeros(G, G, G, device=device, dtype=dtype)
+    # Collect all 8 corner contributions then do a single non-in-place
+    # scatter_add so that gradients flow back to `weights` (and hence to
+    # the GNN that produced f_esc).  In-place scatter_add_ on a leaf
+    # tensor with requires_grad=False breaks the autograd graph.
+    flat_list: list[torch.Tensor] = []
+    w_list:    list[torch.Tensor] = []
 
-    # Trilinear weights: 2³ = 8 corners
     for bx, wx in [(i0[:, 0], f0[:, 0]), (i1[:, 0], f1[:, 0])]:
         for by, wy in [(i0[:, 1], f0[:, 1]), (i1[:, 1], f1[:, 1])]:
             for bz, wz in [(i0[:, 2], f0[:, 2]), (i1[:, 2], f1[:, 2])]:
-                w = weights * wx * wy * wz  # (N,)
-                # Periodic index wrap
-                bx_p = bx % G
-                by_p = by % G
-                bz_p = bz % G
-                flat_idx = bx_p * G * G + by_p * G + bz_p
-                grid.view(-1).scatter_add_(0, flat_idx, w)
+                w_corner = weights * wx * wy * wz      # (N,)
+                flat     = (bx % G) * G * G + (by % G) * G + (bz % G)  # (N,)
+                flat_list.append(flat)
+                w_list.append(w_corner)
 
-    return grid   # (G, G, G)
+    flat_cat = torch.cat(flat_list, dim=0)   # (8*N,)
+    w_cat    = torch.cat(w_list,    dim=0)   # (8*N,)  requires_grad == weights.requires_grad
+
+    # out-of-place scatter_add: differentiable w.r.t. w_cat
+    grid = torch.zeros(G * G * G, device=device, dtype=dtype).scatter_add(
+        0, flat_cat, w_cat
+    )
+    return grid.view(G, G, G).contiguous()   # (G, G, G)
 
 
 def fft_convolve_3d(
@@ -79,11 +87,14 @@ def fft_convolve_3d(
     Differentiable w.r.t. source_grid; kernel_grid needs separate handling
     (we rebuild it from learnable parameters each step via make_3d_kernel_grid).
     """
-    # Use torch.fft for differentiability
-    S_fft = torch.fft.rfftn(source_grid)
-    K_fft = torch.fft.rfftn(kernel_grid)
+    # rfftn requires contiguous float input (roll/strided views trigger resize warnings)
+    _dims = (-3, -2, -1)
+    x = source_grid.float().contiguous()
+    k = kernel_grid.float().contiguous()
+    S_fft = torch.fft.rfftn(x, dim=_dims)
+    K_fft = torch.fft.rfftn(k, dim=_dims)
     J_fft = S_fft * K_fft
-    J = torch.fft.irfftn(J_fft, s=source_grid.shape)
+    J = torch.fft.irfftn(J_fft, s=x.shape, dim=_dims)
     return J.clamp(min=0.)   # ionizing flux must be non-negative
 
 

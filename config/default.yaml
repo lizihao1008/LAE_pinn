@@ -37,6 +37,15 @@ source_head:
   xi_ion_learnable: false             # if false, fixed at log10(25.2)
   xi_ion_log: 25.2                    # ionizing photon production efficiency
 
+# RSD correction: network learns to invert per-source LOS position shift
+# caused by peculiar velocities.  Halo_Position.npy is in redshift space;
+# Xbox_grid is in real space.  This head predicts Δr∥_i from the local
+# environment embedding so the scatter step operates in real space.
+rsd_correction:
+  enabled: True                      # set true to activate
+  max_shift_mpc: 5                  # ±2 cMpc/h ≈ ±1 voxel at 64³, z~7
+  los_axis: 0                         # 0/1/2 — which axis is line-of-sight
+
 kernel:
   type: mixture                       # "mfp" | "bubble" | "mixture"
   # Learnable initial values (softplus / sigmoid applied internally)
@@ -47,15 +56,27 @@ kernel:
   A_trans_init: 0.5                   # trans weight before softmax
 
 unresolved_sources:
-  n_populations: 3                    # bright, faint, diffuse
-  population_labels: [bright, faint, diffuse]
-  density_power_law: true             # ε_b ∝ ρ^α_b
-  smoothness_weight: 1.0e-3          # TV prior on ε_unres
-  lf_prior_weight: 0.1               # KL to luminosity-function budget
+  # HOD-based faint source model.  Basis fields are pre-computed once before
+  # training from the halo catalog (simulation) or ACF-fitted HOD (observations).
+  # Only f_esc per mass bin is learned during training.
+  n_hod_bins: 3                       # number of faint-halo M_UV bins
+  muv_det: -17.5                      # detection threshold (M_UV < muv_det = detected)
+  muv_bin_edges: [-17.5, -16.5, -15.0]  # M_UV edges for faint bins; last bin open-ended
+  bin_labels: [near_thresh, intermediate, faint]
+  smoothness_weight: 1.0e-3           # TV prior on ε_unres (in loss.py)
+  # ── Observations interface ───────────────────────────────────────────────
+  # Set hod_from_observations.enabled: true when applying to real data.
+  # Provide per-bin params from ACF fitting + HOD extrapolation.
+  hod_from_observations:
+    enabled: false
+    # bias_per_bin: [4.2, 2.8, 1.9]         # linear bias from ACF fitting
+    # n_bar_per_bin: [3.0e-4, 8.0e-4, 2.0e-3]  # number density (cMpc/h)^-3
+    # mean_log_lum_per_bin: [40.1, 39.5, 38.8]  # log10(L_Lyα) from abundance matching
 
 excursion_set:
-  threshold_init: 0.0                 # learnable; before sigmoid
-  sharpness_init: 1.0                 # learnable τ; before softplus
+  # s = alpha_nH_scale: one scalar for α(T)·⟨n_H⟩ + J unit conversion
+  # Mapping: A = g·J/s,  x_HII = (√(A²+4A)−A)/2;  g from global ξ constraint
+  alpha_nH_scale_init: 1.0
 
 training:
   batch_size: 1                       # 1 snapshot per step (full-field)

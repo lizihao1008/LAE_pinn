@@ -33,8 +33,8 @@ KERNEL_ABLATIONS = {
 }
 
 SOURCE_ABLATIONS = {
-    "B1_no_unresolved":  dict(n_populations=0),
-    "B3_constrained":    dict(n_populations=3),
+    "B1_no_unresolved":  dict(n_hod_bins=0),
+    "B3_constrained":    dict(n_hod_bins=3),
 }
 
 GNN_ABLATIONS = {
@@ -57,8 +57,8 @@ ALL_ABLATIONS = {**KERNEL_ABLATIONS, **SOURCE_ABLATIONS, **GNN_ABLATIONS}
 def run_one(name: str, extra_cfg: dict, base_graph, snap, device, args) -> dict:
     """Run one ablation variant."""
     g = args.grid
-    n_pop = extra_cfg.pop("n_populations", 3)
-    n_layers = extra_cfg.pop("gnn_n_layers", 3)
+    n_bins    = extra_cfg.pop("n_hod_bins", 3)
+    n_layers  = extra_cfg.pop("gnn_n_layers", 3)
     learnable_kernel = extra_cfg.pop("learnable_kernel", True)
 
     model = LAEPINN(
@@ -67,7 +67,7 @@ def run_one(name: str, extra_cfg: dict, base_graph, snap, device, args) -> dict:
         gnn_out_channels=16,
         gnn_n_layers=max(1, n_layers),
         gnn_heads=2,
-        n_populations=n_pop,
+        n_hod_bins=max(1, n_bins),
         grid_size=g,
         box_size=snap.box_size,
         **{k: v for k, v in extra_cfg.items() if k.startswith("kernel")},
@@ -85,8 +85,7 @@ def run_one(name: str, extra_cfg: dict, base_graph, snap, device, args) -> dict:
 
     model.eval()
     with torch.no_grad():
-        out = model(base_graph.to(device), base_graph.density_basis,
-                    xi_global=base_graph.xi_global)
+        out = model(base_graph.to(device), hod_basis=base_graph.hod_basis)
 
     x_pred = out["x_hii_pred"].cpu().numpy()
     x_true = base_graph.xbox_true.squeeze().cpu().numpy()

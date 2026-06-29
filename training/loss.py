@@ -74,9 +74,16 @@ def binary_bce_loss(
 ) -> torch.Tensor:
     """
     Binary topology loss: BCE between predicted field and binary true field.
+
+    nan_to_num guard: NaN in x_pred (e.g. from extreme early-training
+    activations) survives clamp and causes F.binary_cross_entropy to raise
+    "all elements of input should be between 0 and 1".  Map NaN/Inf safely
+    before clamping.
     """
     x_true_bin = (x_true > threshold).float()
-    return F.binary_cross_entropy(x_pred.clamp(1e-6, 1 - 1e-6), x_true_bin)
+    x_pred_safe = torch.nan_to_num(x_pred, nan=0.5, posinf=1.0, neginf=0.0)
+    x_pred_safe = x_pred_safe.clamp(1e-6, 1 - 1e-6)
+    return F.binary_cross_entropy(x_pred_safe, x_true_bin)
 
 
 def global_xhii_loss(
@@ -89,7 +96,7 @@ def global_xhii_loss(
 
 
 def prior_loss(
-    unresolved_module,   # UnresolvedSourceField
+    unresolved_module,   # HODUnresolvedField (or any module with lf_kl_loss())
     J_unres: torch.Tensor,
     lf_weight: float = 0.1,
     smooth_weight: float = 1e-3,
