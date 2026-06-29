@@ -135,8 +135,9 @@ def train(
             with torch.no_grad():
                 last_out    = model(graph, hod_basis=graph.hod_basis,
                                     return_intermediates=False)
-                x_pred_mean = float(last_out["x_hii_pred"].mean().item())
-                j_scale_val = last_out.get("J_scale", float("nan"))
+                x_pred_mean  = float(last_out["x_hii_pred"].mean().item())
+                j_scale_val  = last_out.get("J_scale", float("nan"))
+                s_obs_scale  = last_out.get("S_obs_scale", float("nan"))
 
             xi_last   = float(graph.xi_global)
             n_bins    = model.unresolved.n_bins
@@ -157,7 +158,7 @@ def train(
                 f"field={epoch_losses['field']:.4f} | "
                 f"xHII={epoch_losses['xhii']:.4f} | "
                 f"<x_pred>={x_pred_mean:.3f} ξ={xi_last:.3f} | "
-                f"α={phys.get('alpha_nH_scale', 0):.3f} J̄={j_scale_val:.2e} | "
+                f"α={phys.get('alpha_nH_scale', 0):.3f} J̄={j_scale_val:.2e} Sobs={s_obs_scale:.2e} | "
                 f"R={phys.get('R_bub', 0):.2f} λ={phys.get('lambda_mfp', 0):.2f} | "
                 f"{fesc_str} | {dt:.1f}s"
             )

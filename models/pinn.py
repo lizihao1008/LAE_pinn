@@ -217,12 +217,29 @@ class LAEPINN(nn.Module):
         #    ε_b(x) = 1 + b_b δ_dm(x) is the fixed HOD basis; only f_esc_b learned.
         S_unres = self.unresolved(hod_basis)              # (G, G, G)
 
-        # 6. Convolve TOTAL source density with radiative kernel K(r; θ_K).
-        #    Both observed LAEs and unresolved halos share the same propagation kernel:
-        #      J_total(x) = (S_obs + S_unres) * K
-        #    By linearity this equals (S_obs * K) + (S_unres * K), but one
-        #    FFT convolution is cheaper and the notation is cleaner.
-        J_total = fft_convolve_3d(S_obs + S_unres, kernel_grid)   # (G, G, G)
+        # 6. Amplitude-balance S_obs before combining with S_unres.
+        #
+        #    HOD basis fields ε_b are normalised to unit mean in preprocessing,
+        #    so  mean(S_unres) = n_bins × <f_esc> ≈ n_bins × 0.5 = O(1–5).
+        #    S_obs amplitude = N_obs × <w_eff> / G³:  with N_obs ~ few thousand and
+        #    G=64,  mean(S_obs) ~ O(1e-3).  The ~1000× imbalance lets S_unres
+        #    dominate J_total completely, washing out all spatial structure from
+        #    the observed LAE scatter regardless of what the GNN learns.
+        #
+        #    Fix: normalise S_obs to unit mean (same convention as ε_b) before
+        #    the convolution.  This is safe because J_total is re-scaled by its
+        #    own spatial mean in step 7 anyway — only the spatial *contrast* of
+        #    J matters for x_pred, not its absolute level.
+        #
+        #    After this normalisation, S_obs contributes mean=1 and S_unres
+        #    contributes mean = n_bins × f_esc  (~0–9).  As training proceeds,
+        #    f_esc drives to small values, balancing the two terms.
+        S_obs_scale = S_obs.mean().detach().clamp(min=1e-12)
+        S_obs_normed = S_obs / S_obs_scale   # unit mean; spatial structure preserved
+
+        # 6b. Convolve TOTAL source density with radiative kernel K(r; θ_K).
+        #     J_total(x) = (S_obs_normed + S_unres) * K
+        J_total = fft_convolve_3d(S_obs_normed + S_unres, kernel_grid)   # (G, G, G)
 
         # 7. J → x_HII
         # Normalise J by its spatial mean before the excursion mapping.
@@ -252,17 +269,19 @@ class LAEPINN(nn.Module):
             out["delta_los_mean_mpc"] = float(dl.mean().item() * box)
             out["delta_los_std_mpc"]  = float(dl.std().item()  * box)
 
-        # Always expose J_scale so the training loop can log it cheaply
-        out["J_scale"] = float(J_scale.item())
+        # Always expose scales so the training loop can log amplitude diagnostics
+        out["J_scale"]     = float(J_scale.item())
+        out["S_obs_scale"] = float(S_obs_scale.item())   # raw S_obs mean (pre-normalisation)
 
         if return_intermediates:
             out.update({
-                "S_obs":       S_obs,       # scatter grid of LAEs  (pre-kernel)
-                "S_unres":     S_unres,     # unresolved source density (pre-kernel)
-                "J_total":     J_total,     # (S_obs + S_unres) * K  (radiation field)
+                "S_obs":       S_obs,         # raw scatter grid (pre-normalisation)
+                "S_obs_normed":S_obs_normed,  # unit-mean scatter grid (fed into convolution)
+                "S_unres":     S_unres,       # unresolved source density (pre-kernel)
+                "J_total":     J_total,       # (S_obs_normed + S_unres) * K
                 "kernel_grid": kernel_grid,
                 # backward-compat aliases used by loss.py (TV prior on J_unres)
-                "J_obs":       S_obs,
+                "J_obs":       S_obs_normed,
                 "J_unres":     S_unres,
             })
 
