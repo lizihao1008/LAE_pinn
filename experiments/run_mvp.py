@@ -80,17 +80,29 @@ def main():
 
     # ---- 1. Load data ----
     print("Loading simulation snapshot...")
-    snap = load_snapshot(args.sim_root, args.redshift)
-    snap = apply_source_model(snap, "observed_only" if args.muv_cut > -90 else "fiducial")
-    print(f"  {snap.n_halos} halos after MUV cut {args.muv_cut}")
+    # Load FULL snapshot first (all halos including faint) for HOD calibration.
+    # HOD calibration must see the faint halo population (MUV > -17.5) that we
+    # are trying to model — filtering first would make all bins empty.
+    snap_full = load_snapshot(args.sim_root, args.redshift)
+    # Observed LAEs: filtered catalog used for the GNN graph
+    snap = apply_source_model(snap_full, "observed_only" if args.muv_cut > -90 else "fiducial")
+    print(f"  {snap.n_halos} observed LAEs after MUV cut (full catalog: {snap_full.n_halos})")
     print(f"  xi_global = {snap.xi_global:.3f}  (x_HI ~ {1 - snap.xi_global:.2f})")
 
     # ---- 2. Preprocess ----
     print("Preprocessing features...")
-    # For MVP we use single snapshot; compute stats on it
-    from data.preprocessing import compute_feature_stats, prepare_snapshot
+    from data.preprocessing import compute_feature_stats, prepare_snapshot, build_hod_basis_from_simulation
+    # HOD calibration on the FULL halo catalog (faint halos must be present)
+    hod_calibration = build_hod_basis_from_simulation(snap_full, grid_size=args.grid)
+    bias_str = ", ".join(f"b{b}={hod_calibration.hod_params['bias'][b]:.2f}"
+                         for b in range(len(hod_calibration.bin_labels)))
+    n_str    = ", ".join(f"N{b}={hod_calibration.hod_params['N_halos'][b]}"
+                         for b in range(len(hod_calibration.bin_labels)))
+    print(f"  HOD calibration: [{bias_str}]  [{n_str}]")
+
     stats = compute_feature_stats([snap])
-    snap_dict = prepare_snapshot(snap, stats, grid_size=args.grid, device=device)
+    snap_dict = prepare_snapshot(snap, stats, grid_size=args.grid, device=device,
+                                 hod_calibration=hod_calibration)
 
     # ---- 3. Build graph ----
     print(f"Building k-NN graph (k={args.k_neighbors}, r_max={args.r_link} cMpc/h)...")

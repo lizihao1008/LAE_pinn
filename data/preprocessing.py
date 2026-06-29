@@ -286,7 +286,16 @@ def build_hod_basis_from_simulation(
         rho   = np.clip(rho, 0.0, None) + 1e-4
         delta = rho / rho.mean() - 1.0
     else:
-        delta = np.zeros((G, G, G), dtype=np.float64)
+        # No DM density grid available: use the full halo number density as a
+        # proxy.  Halos trace DM with some mean bias, so Cov(n_b, δ_halo)/Var(δ_halo)
+        # is a valid relative bias estimator even if the absolute normalisation is
+        # off.  Much better than zeros (which give b_b = 0 for all bins).
+        n_all  = _scatter_count_to_grid(snap.pos, snap.box_size, G)
+        n_mean = float(n_all.mean())
+        if n_mean > 1e-10:
+            delta = (n_all / n_mean - 1.0).astype(np.float64)
+        else:
+            delta = np.zeros((G, G, G), dtype=np.float64)
 
     var_delta = float(np.var(delta))
 

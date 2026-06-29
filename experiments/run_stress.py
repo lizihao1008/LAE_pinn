@@ -64,12 +64,15 @@ STRESS_TESTS = {
 
 
 def run_stress_test(name: str, cfg_st: dict, args, device: torch.device) -> dict:
-    snap = load_snapshot(args.sim_root, cfg_st["train_z"])
-    snap = apply_source_model(snap, cfg_st["source_model"])
+    # HOD calibration needs the full halo catalog (faint halos present).
+    snap_full = load_snapshot(args.sim_root, cfg_st["train_z"])
+    snap = apply_source_model(snap_full, cfg_st["source_model"])
 
-    from data.preprocessing import compute_feature_stats, prepare_snapshot
+    from data.preprocessing import compute_feature_stats, prepare_snapshot, build_hod_basis_from_simulation
+    hod_calibration = build_hod_basis_from_simulation(snap_full, grid_size=args.grid)
     stats = compute_feature_stats([snap])
-    snap_dict = prepare_snapshot(snap, stats, grid_size=args.grid, device=device)
+    snap_dict = prepare_snapshot(snap, stats, grid_size=args.grid, device=device,
+                                 hod_calibration=hod_calibration)
     graph = build_graph_from_snapshot(snap_dict, subsample=args.subsample)
 
     model = LAEPINN(
