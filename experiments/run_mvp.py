@@ -182,6 +182,8 @@ def main():
     x_pred_np = out["x_hii_pred"].cpu().numpy()
     x_true_np = graph.xbox_true.squeeze().cpu().numpy()
 
+    np.save(os.path.join(args.save_dir, "x_pred.npy"), x_pred_np)
+    np.save(os.path.join(args.save_dir, "x_true.npy"), x_true_np)
     # Field metrics
     fm = field_metrics(x_pred_np, x_true_np)
     print(f"\nField metrics:")
