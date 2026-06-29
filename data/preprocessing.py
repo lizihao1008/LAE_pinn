@@ -340,10 +340,17 @@ def build_hod_basis_from_simulation(
             # Mean log10(L_Lyα) for amplitude reference (logging only)
             mean_lum = float(_log10_lya(lya_faint[mask_bin]).mean())
 
-            # Linear bias from cross-correlation:  b = Cov(n, δ) / Var(δ)
-            if var_delta > 1e-8:
-                cov_nd = float(np.mean((n_grid - n_grid.mean()) * delta))
-                bias_b = float(np.clip(cov_nd / var_delta, 0.0, 20.0))
+            # Linear bias from cross-correlation:
+            #   b_linear = Cov(δ_n, δ_DM) / Var(δ_DM)
+            # where δ_n = (n - n̄)/n̄  is the fractional number overdensity.
+            #
+            # BUG FIX: the previous code computed Cov(n - n̄, δ) / Var(δ),
+            # which equals n̄ × b_linear (n̄ times too large in the numerator,
+            # giving b values ~10× too small for sparse halo bins).
+            if var_delta > 1e-8 and n_bar_b > 1e-8:
+                delta_n = (n_grid - n_bar_b) / n_bar_b   # fractional overdensity
+                cov_nd  = float(np.mean(delta_n * delta))
+                bias_b  = float(np.clip(cov_nd / var_delta, 0.0, 20.0))
             else:
                 bias_b = 0.0
 

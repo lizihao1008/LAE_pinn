@@ -36,6 +36,11 @@ def power_spectrum_loss(
     """
     Isotropic 3D power spectrum MSE.
     Computed via FFT on the (G,G,G) field.
+
+    Gradient note: ps_binned must be built via torch.stack (not in-place
+    assignment to a zeros tensor).  In-place writes to a leaf tensor with
+    requires_grad=False do NOT enter the autograd graph, so the gradient
+    would be silently zeroed out before reaching x_pred.
     """
     def _ps(field):
         fk = torch.fft.rfftn(field)
@@ -49,15 +54,19 @@ def power_spectrum_loss(
         k_mag = (kx3 ** 2 + ky3 ** 2 + kz3 ** 2).sqrt()
         k_flat = k_mag.flatten()
         pk_flat = pk.flatten()
-        # Bin into shells
+        # Bin into k-shells.
+        # Use torch.stack on a list — NOT in-place assignment to torch.zeros —
+        # so that gradients flow from each bin's mean back through pk_flat to field.
         k_max = k_flat.max()
         bins  = torch.linspace(0, k_max + 1e-6, n_k_bins + 1, device=field.device)
-        ps_binned = torch.zeros(n_k_bins, device=field.device)
+        ps_list = []
         for i in range(n_k_bins):
             mask = (k_flat >= bins[i]) & (k_flat < bins[i + 1])
             if mask.sum() > 0:
-                ps_binned[i] = pk_flat[mask].mean()
-        return ps_binned
+                ps_list.append(pk_flat[mask].mean())   # keeps grad
+            else:
+                ps_list.append(pk_flat.new_zeros(()))  # empty bin: differentiable zero
+        return torch.stack(ps_list)   # (n_k_bins,) — gradient intact
 
     ps_pred = _ps(x_pred)
     ps_true = _ps(x_true)
