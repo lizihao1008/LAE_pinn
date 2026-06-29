@@ -131,7 +131,11 @@ def train(
             dt = time.time() - t0
             phys = model.get_learnable_physics()
 
-            # Diagnostics from the last graph in this epoch
+            # Diagnostics from the last graph in this epoch.
+            # Switch to eval() so dropout is disabled — otherwise the reported
+            # <x>, std and Jσ are contaminated by GNN dropout noise and do not
+            # reflect the deterministic field the model actually predicts.
+            model.eval()
             with torch.no_grad():
                 last_out    = model(graph, hod_basis=graph.hod_basis,
                                     return_intermediates=True)
@@ -169,6 +173,7 @@ def train(
                 f"R={phys.get('R_bub', 0):.2f} λ={phys.get('lambda_mfp', 0):.2f} | "
                 f"{fesc_str} | {dt:.1f}s"
             )
+            model.train()   # restore training mode after eval-mode diagnostics
 
     # Save
     torch.save(model.state_dict(), os.path.join(save_dir, "model.pt"))

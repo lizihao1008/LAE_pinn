@@ -149,6 +149,21 @@ class LAEPINN(nn.Module):
         # the target x_HII field.
         self._log_A_obs = nn.Parameter(torch.tensor(0.0))
 
+        # --- Amplitude reference constants (calibrated ONCE, then fixed) ---
+        # The previous implementation recomputed two DETACHED means every step
+        #   A_obs_eq = mean(S_unres)/mean(S_obs)   and   J_scale = mean(J_total)
+        # which made the forward output exactly invariant to the overall
+        # amplitude of the source field.  As a result the photon budget
+        # (f_esc, source weights) could not change <x_HII>, the field was
+        # locked in the low-A regime (no spatial contrast), and the detach
+        # created a spurious common-mode gradient that dragged every f_esc bin
+        # to the same value.  We instead calibrate these constants on the FIRST
+        # forward pass and hold them fixed, so amplitude changes propagate to
+        # x_HII while the sane init (mean(J/J_ref)=1) is preserved.
+        self.register_buffer("_amp_calibrated", torch.tensor(False))
+        self.register_buffer("_A_obs_base", torch.tensor(1.0))
+        self.register_buffer("_J_ref", torch.tensor(1.0))
+
         # --- Ionization equilibrium ---
         # Photoionization balance Γ(1−x)n_H = α n_e n_p  →  x_HII(J) via A=J/s.
         # Single learnable s absorbs recombination coeff α and mean density n_H
@@ -230,48 +245,47 @@ class LAEPINN(nn.Module):
         #    ε_b(x) = 1 + b_b δ_dm(x) is the fixed HOD basis; only f_esc_b learned.
         S_unres = self.unresolved(hod_basis)              # (G, G, G)
 
-        # 6. Convolve TOTAL source density with radiative kernel K(r; θ_K).
-        #    J_total(x) = (A_obs × S_obs + S_unres) * K
+        # 6. Convolve TOTAL source density with the radiative kernel K(r; θ_K).
+        #        J_total(x) = (A_obs · S_obs + S_unres) * K        [K sums to 1]
         #
-        #    Without amplitude balancing: S_obs/S_unres ≈ 0.7%, giving Jσ ≈ 0.04
-        #    and x_pred std ≈ 0.005 — too small to learn spatial structure.
-        #    A_obs rebalances so both terms contribute equally in mean.
-        #    Pearson(J_obs, x_HII) ≈ 0.32 and Pearson(J_unres, x_HII) ≈ 0.60
-        #    (with block-averaged HOD density, b~1.4-1.7), so both carry real signal.
+        #    A_obs balances the sparse LAE term against the HOD background so
+        #    both contribute meaningfully.  Its base value is calibrated ONCE
+        #    (mean(S_unres)/mean(S_obs) on the first batch) and then held fixed;
+        #    _log_A_obs is the learnable deviation on top.
         #
-        # Dynamically balance S_obs amplitude against S_unres so that the
-        # sparse-but-clustered LAE signal can drive ionization structure.
-        # Without this, S_obs/S_unres ≈ 0.7% and LAE clustering contributes
-        # negligibly to J_total (J_norm std ~ 3.7%, x_pred std ~ 0.5%).
-        #
-        # A_obs_eq: the equi-amplitude factor that makes mean(A_obs_eq × S_obs)
-        #           = mean(S_unres).  Computed from the current batch, detached
-        #           so gradients do not flow through this normalisation constant.
-        # _log_A_obs: learnable log-deviation from equi-amplitude.  Starts at 0
-        #             (equi-amplitude) and the model adjusts it based on whether
-        #             LAE clustering correlates with x_HII.  With A_obs at
-        #             equi-amplitude, Jσ rises from ~0.04 to ~0.5, giving
-        #             x_pred std ~0.06 and enabling meaningful spatial learning.
-        S_obs_mean_det  = S_obs.mean().detach().clamp(min=1e-12)
-        S_unres_mean_det = S_unres.mean().detach().clamp(min=1e-12)
-        A_obs_eq = S_unres_mean_det / S_obs_mean_det   # ~157, no gradient
-        A_obs    = A_obs_eq * torch.exp(self._log_A_obs)   # learnable scale
+        #    Crucial: the base is FIXED, not a per-step detached ratio.  A
+        #    per-step detached ratio re-tracks every change in mean(S_obs)/
+        #    mean(S_unres), which (a) cancels the photon-budget signal in the
+        #    forward and (b) is invisible to autograd, producing a spurious
+        #    common-mode gradient that collapses all f_esc bins to one value.
+        if not bool(self._amp_calibrated):
+            with torch.no_grad():
+                s_obs_m = S_obs.mean().clamp(min=1e-12)
+                s_unr_m = S_unres.mean().clamp(min=1e-12)
+                self._A_obs_base.copy_(s_unr_m / s_obs_m)
 
-        S_obs_scale = S_obs_mean_det   # for diagnostics only
+        A_obs   = self._A_obs_base * torch.exp(self._log_A_obs)   # learnable scale
         J_total = fft_convolve_3d(A_obs * S_obs + S_unres, kernel_grid)   # (G, G, G)
 
-        # 7. J → x_HII
-        # Normalise J by its spatial mean before the excursion mapping.
-        # Without this, J values (~1e-3) are orders of magnitude below
-        # alpha_nH_scale (~1.0), giving A = J/s << 1 and x_pred ≈ 0 everywhere
-        # regardless of the spatial structure.  After normalisation:
-        #   mean(J_norm) = 1  →  A ~ 1/s  ~  1 at init  →  x_pred ~ 0.6
-        # which is already near xi_global, so alpha_nH_scale only needs to
-        # fine-tune the transition sharpness via the global_xHII loss.
-        # J_scale is detached so the normalisation constant doesn't zero out
-        # the spatial gradients of J_total.
-        J_scale    = J_total.mean().detach().clamp(min=1e-12)
-        x_hii_pred = self.excursion(J_total / J_scale)
+        # 7. J → x_HII via photoionization equilibrium.
+        #    Normalise J by a FIXED reference (calibrated once on the first
+        #    batch) instead of its per-step spatial mean.  A fixed reference
+        #    keeps the units sane at init — mean(J/J_ref)=1 → A=1/alpha≈A_target
+        #    → mean(x_pred)≈xi — WITHOUT cancelling amplitude information every
+        #    step.  With the old per-step detached J_scale, mean(J/J_scale) was
+        #    forced to 1 on every forward, so <x_HII> was controlled solely by
+        #    alpha_nH_scale and the field could never leave the low-contrast,
+        #    near-uniform small-A regime.  With a fixed reference, stronger
+        #    sources raise both <x_HII> and the spatial contrast, as physics
+        #    requires.
+        if not bool(self._amp_calibrated):
+            with torch.no_grad():
+                self._J_ref.copy_(J_total.mean().clamp(min=1e-12))
+                self._amp_calibrated.fill_(True)
+
+        J_ref       = self._J_ref
+        S_obs_scale = S_obs.mean().detach()   # for diagnostics only
+        x_hii_pred  = self.excursion(J_total / J_ref)
 
         out = {
             "x_hii_pred":  x_hii_pred,
@@ -289,8 +303,8 @@ class LAEPINN(nn.Module):
             out["delta_los_std_mpc"]  = float(dl.std().item()  * box)
 
         # Always expose scales so the training loop can log amplitude diagnostics
-        out["J_scale"]     = float(J_scale.item())
-        out["S_obs_scale"] = float(S_obs_scale.item())   # raw S_obs mean (pre-normalisation)
+        out["J_scale"]     = float(J_ref.item())          # fixed reference (calibrated once)
+        out["S_obs_scale"] = float(S_obs_scale.item())    # raw S_obs mean (per-batch)
         out["A_obs"]       = float(A_obs.detach().item())  # current S_obs amplitude factor
 
         if return_intermediates:
