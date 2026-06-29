@@ -196,7 +196,8 @@ def main():
     print(f"\nTopology statistics (threshold=0.5):")
     topo_pred = compute_all_topology(x_pred_np, dbox_ds, snap.box_size)
     topo_true = compute_all_topology(x_true_np, dbox_ds, snap.box_size)
-
+    np.save(os.path.join(args.save_dir, "topo_pred.npy"), topo_pred)
+    np.save(os.path.join(args.save_dir, "topo_true.npy"), topo_true)
     print(f"  {'Statistic':<30} {'Predicted':>12} {'True':>12}")
     print(f"  {'-'*54}")
     for key in ["percolation_fraction", "n_connected_components", "bsd_median", "bsd_mean"]:
