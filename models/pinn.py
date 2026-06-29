@@ -136,6 +136,19 @@ class LAEPINN(nn.Module):
         # Only f_esc per mass bin is learned.
         self.unresolved = HODUnresolvedField(n_bins=n_hod_bins)
 
+        # --- Learnable S_obs amplitude factor ---
+        # S_obs (sparse observed LAEs) has mean ≈ N_obs/G³ ≈ 0.03, while
+        # S_unres (HOD background) has mean ≈ n_bins × f_esc ≈ 4.4.
+        # Without rebalancing, S_obs contributes only ~0.7% to J_total and
+        # LAE clustering is completely swamped by the HOD background.
+        # A_obs is a learnable amplitude that scales S_obs so it contributes
+        # meaningfully to the ionization structure.  Initialised to 0 in log
+        # space, which gives equi-amplitude (mean(A_obs × S_obs) = mean(S_unres))
+        # via the dynamic rescaling in forward().  The model then learns
+        # to up- or down-weight the LAE term depending on its correlation with
+        # the target x_HII field.
+        self._log_A_obs = nn.Parameter(torch.tensor(0.0))
+
         # --- Ionization equilibrium ---
         # Photoionization balance Γ(1−x)n_H = α n_e n_p  →  x_HII(J) via A=J/s.
         # Single learnable s absorbs recombination coeff α and mean density n_H
@@ -218,26 +231,34 @@ class LAEPINN(nn.Module):
         S_unres = self.unresolved(hod_basis)              # (G, G, G)
 
         # 6. Convolve TOTAL source density with radiative kernel K(r; θ_K).
-        #    Both observed LAEs and unresolved halos share the same propagation kernel:
-        #      J_total(x) = (S_obs + S_unres) * K
+        #    J_total(x) = (A_obs × S_obs + S_unres) * K
         #
-        #    Amplitude note: HOD basis fields ε_b have unit mean (normalised in
-        #    preprocessing), so mean(S_unres) = Σ_b f_esc_b ~ O(n_bins × 0.5).
-        #    mean(S_obs) = N_obs × <w_eff> / G³ ~ O(1e-3) for N_obs ~ thousands.
-        #    S_unres therefore dominates in amplitude, which is physically correct:
-        #    there are ~100–1000× more faint unresolved halos than detected LAEs.
-        #    Their spatial variation (HOD bias field ε_b, b~3–6 on real data)
-        #    provides the primary ionization structure; S_obs provides a secondary
-        #    high-contrast signal at bright-LAE positions.
-        #    On spatially shuffled data (b≈0), ε_b≈1 everywhere and J_total is
-        #    uniform regardless of S_obs amplitude — the data, not the model, is
-        #    the limiting factor.
+        #    Without amplitude balancing: S_obs/S_unres ≈ 0.7%, giving Jσ ≈ 0.04
+        #    and x_pred std ≈ 0.005 — too small to learn spatial structure.
+        #    A_obs rebalances so both terms contribute equally in mean.
+        #    Pearson(J_obs, x_HII) ≈ 0.32 and Pearson(J_unres, x_HII) ≈ 0.60
+        #    (with block-averaged HOD density, b~1.4-1.7), so both carry real signal.
         #
-        #    J_total is normalised by its spatial mean in step 7, so the absolute
-        #    amplitude cancels; only spatial contrast (std/mean of J) matters for
-        #    x_pred.
-        S_obs_scale = S_obs.mean().detach().clamp(min=1e-12)   # for diagnostics only
-        J_total = fft_convolve_3d(S_obs + S_unres, kernel_grid)   # (G, G, G)
+        # Dynamically balance S_obs amplitude against S_unres so that the
+        # sparse-but-clustered LAE signal can drive ionization structure.
+        # Without this, S_obs/S_unres ≈ 0.7% and LAE clustering contributes
+        # negligibly to J_total (J_norm std ~ 3.7%, x_pred std ~ 0.5%).
+        #
+        # A_obs_eq: the equi-amplitude factor that makes mean(A_obs_eq × S_obs)
+        #           = mean(S_unres).  Computed from the current batch, detached
+        #           so gradients do not flow through this normalisation constant.
+        # _log_A_obs: learnable log-deviation from equi-amplitude.  Starts at 0
+        #             (equi-amplitude) and the model adjusts it based on whether
+        #             LAE clustering correlates with x_HII.  With A_obs at
+        #             equi-amplitude, Jσ rises from ~0.04 to ~0.5, giving
+        #             x_pred std ~0.06 and enabling meaningful spatial learning.
+        S_obs_mean_det  = S_obs.mean().detach().clamp(min=1e-12)
+        S_unres_mean_det = S_unres.mean().detach().clamp(min=1e-12)
+        A_obs_eq = S_unres_mean_det / S_obs_mean_det   # ~157, no gradient
+        A_obs    = A_obs_eq * torch.exp(self._log_A_obs)   # learnable scale
+
+        S_obs_scale = S_obs_mean_det   # for diagnostics only
+        J_total = fft_convolve_3d(A_obs * S_obs + S_unres, kernel_grid)   # (G, G, G)
 
         # 7. J → x_HII
         # Normalise J by its spatial mean before the excursion mapping.
@@ -270,6 +291,7 @@ class LAEPINN(nn.Module):
         # Always expose scales so the training loop can log amplitude diagnostics
         out["J_scale"]     = float(J_scale.item())
         out["S_obs_scale"] = float(S_obs_scale.item())   # raw S_obs mean (pre-normalisation)
+        out["A_obs"]       = float(A_obs.detach().item())  # current S_obs amplitude factor
 
         if return_intermediates:
             out.update({
@@ -292,6 +314,8 @@ class LAEPINN(nn.Module):
         # f_esc per HOD mass bin (keys: "fesc_bin0", "fesc_bin1", ...)
         params.update(self.unresolved.get_fesc_dict())
         params["alpha_nH_scale"] = float(self.excursion.alpha_nH_scale.item())
+        # log_A_obs: learnable log-deviation from equi-amplitude for S_obs vs S_unres
+        params["log_A_obs"] = float(self._log_A_obs.item())
         return params
 
 

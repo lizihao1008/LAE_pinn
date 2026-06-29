@@ -140,6 +140,7 @@ def train(
                 x_pred_std  = float(x_pred.std().item())   # spatial contrast: 0 = uniform
                 j_scale_val = last_out.get("J_scale", float("nan"))
                 s_obs_scale = last_out.get("S_obs_scale", float("nan"))
+                a_obs_val   = last_out.get("A_obs", float("nan"))
                 # J_norm spatial contrast: how much variation the kernel actually sees
                 j_total     = last_out.get("J_total")
                 j_norm_std  = float((j_total / j_total.mean()).std().item()) if j_total is not None else float("nan")
@@ -163,7 +164,7 @@ def train(
                 f"field={epoch_losses['field']:.4f} | "
                 f"xHII={epoch_losses['xhii']:.4f} | "
                 f"<x>={x_pred_mean:.3f}±{x_pred_std:.3f} ξ={xi_last:.3f} | "
-                f"Jσ={j_norm_std:.3f} Sobs={s_obs_scale:.2e} | "
+                f"Jσ={j_norm_std:.3f} Sobs={s_obs_scale:.2e} A_obs={a_obs_val:.1f} | "
                 f"α={phys.get('alpha_nH_scale', 0):.3f} "
                 f"R={phys.get('R_bub', 0):.2f} λ={phys.get('lambda_mfp', 0):.2f} | "
                 f"{fesc_str} | {dt:.1f}s"

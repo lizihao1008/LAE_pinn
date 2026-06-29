@@ -31,7 +31,6 @@ from dataclasses import dataclass, field as dc_field
 
 import numpy as np
 import torch
-from scipy.ndimage import zoom
 
 from .loader import SimSnapshot
 
@@ -43,10 +42,30 @@ from .loader import SimSnapshot
 def downsample_grid(grid: np.ndarray, target: int = 64) -> np.ndarray:
     """
     Downsample a cubic grid from its native resolution to (target)^3.
-    Uses simple averaging (zoom with order=1) to preserve mean.
+
+    Uses block averaging (mean of (N/target)^3 sub-voxels) rather than
+    interpolation.  Interpolation (e.g. scipy.ndimage.zoom order=1) samples
+    a single point per output voxel, which preserves the high-frequency
+    variance of the native grid and inflates std(delta) by up to 2.5×
+    compared to the true large-scale field.
+
+    For the DM density field this inflated variance suppresses the inferred
+    HOD linear bias by the same factor (b = Cov/Var, so larger Var → smaller b).
+    Block averaging is the physically correct operation: it gives the true
+    mean density (or ionization fraction) per output voxel.
+
+    Requires that the input grid size is divisible by target (enforced by assert).
     """
-    factor = target / grid.shape[0]
-    return zoom(grid, factor, order=1)
+    src = grid.shape[0]
+    assert src % target == 0, (
+        f"downsample_grid: input size {src} must be divisible by target {target}"
+    )
+    factor = src // target
+    # Reshape into (target, factor, target, factor, target, factor) and average
+    # over the three 'factor' axes → (target, target, target)
+    return (grid
+            .reshape(target, factor, target, factor, target, factor)
+            .mean(axis=(1, 3, 5)))
 
 
 def grid_to_tensor(grid: np.ndarray, device: str | torch.device = "cpu") -> torch.Tensor:
