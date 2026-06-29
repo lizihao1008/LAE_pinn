@@ -85,20 +85,40 @@ def main():
     # are trying to model — filtering first would make all bins empty.
     snap_full = load_snapshot(args.sim_root, args.redshift)
     # Observed LAEs: filtered catalog used for the GNN graph
-    snap = apply_source_model(snap_full, "observed_only" if args.muv_cut > -90 else "fiducial")
+    # Filter observed LAEs using the user-specified muv_cut (not hardcoded -17.5)
+    if args.muv_cut > -90:
+        snap = snap_full.filter_by_muv(args.muv_cut)
+    else:
+        snap = snap_full  # fiducial: all halos
     print(f"  {snap.n_halos} observed LAEs after MUV cut (full catalog: {snap_full.n_halos})")
     print(f"  xi_global = {snap.xi_global:.3f}  (x_HI ~ {1 - snap.xi_global:.2f})")
 
     # ---- 2. Preprocess ----
     print("Preprocessing features...")
     from data.preprocessing import compute_feature_stats, prepare_snapshot, build_hod_basis_from_simulation
+    # HOD bin edges: from muv_cut to -15 in 0.5 mag steps.
+    # Faint (unresolved) halos are those fainter than muv_cut (MUV > muv_cut).
+    # Bins end at -15 because the simulation has virtually no halos fainter than that.
+    # The last bin in build_hod_basis_from_simulation is always open-ended (MUV > last edge),
+    # which captures any residual halos below -15 without needing an explicit upper bound.
+    muv_faint_limit = -15.0
+    muv_bin_step    = 0.5
+    muv_bin_edges   = list(np.arange(args.muv_cut, muv_faint_limit + 1e-6, muv_bin_step))
+    n_hod_bins      = len(muv_bin_edges)   # last bin open-ended: MUV > muv_faint_limit
+    print(f"  HOD bins: {n_hod_bins} bins from MUV={muv_bin_edges[0]:.1f} "
+          f"to MUV={muv_bin_edges[-1]:.1f} (step {muv_bin_step} mag)")
+
     # HOD calibration on the FULL halo catalog (faint halos must be present)
-    hod_calibration = build_hod_basis_from_simulation(snap_full, grid_size=args.grid)
-    bias_str = ", ".join(f"b{b}={hod_calibration.hod_params['bias'][b]:.2f}"
+    hod_calibration = build_hod_basis_from_simulation(
+        snap_full,
+        muv_det       = args.muv_cut,
+        muv_bin_edges = muv_bin_edges,
+        grid_size     = args.grid,
+    )
+    bias_str = "  ".join(f"b{b}={hod_calibration.hod_params['bias'][b]:.2f}"
+                         f"(N={hod_calibration.hod_params['N_halos'][b]})"
                          for b in range(len(hod_calibration.bin_labels)))
-    n_str    = ", ".join(f"N{b}={hod_calibration.hod_params['N_halos'][b]}"
-                         for b in range(len(hod_calibration.bin_labels)))
-    print(f"  HOD calibration: [{bias_str}]  [{n_str}]")
+    print(f"  HOD: {bias_str}")
 
     stats = compute_feature_stats([snap])
     snap_dict = prepare_snapshot(snap, stats, grid_size=args.grid, device=device,
@@ -123,7 +143,7 @@ def main():
         kernel_R_init=5.0,
         kernel_delta_init=1.0,
         kernel_lambda_mfp_init=20.0,
-        n_hod_bins=3,
+        n_hod_bins=n_hod_bins,
         grid_size=args.grid,
         box_size=snap.box_size,
     )

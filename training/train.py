@@ -63,6 +63,19 @@ def train(
 
     history = {"total": [], "field": [], "ps": [], "bce": [], "xhii": [], "prior": []}
 
+    # Print HOD calibration once (it's fixed throughout training)
+    if verbose:
+        for graph in graph_list:
+            hod_cal = getattr(graph, "hod_calibration", None)
+            if hod_cal is not None:
+                bias_info = "  ".join(
+                    f"{hod_cal.bin_labels[b]}:b={hod_cal.hod_params['bias'][b]:.2f}"
+                    f"(N={hod_cal.hod_params['N_halos'][b]})"
+                    for b in range(len(hod_cal.bin_labels))
+                )
+                print(f"HOD calibration ({hod_cal.source}): {bias_info}")
+                break   # only log once
+
     for epoch in range(1, n_epochs + 1):
         t0 = time.time()
         epoch_losses = {k: 0.0 for k in history}
@@ -128,14 +141,15 @@ def train(
             xi_last   = float(graph.xi_global)
             n_bins    = model.unresolved.n_bins
             fesc_vals = [phys.get(f"fesc_bin{b}", 0.0) for b in range(n_bins)]
-            fesc_str  = " ".join(f"fesc[{b}]={v:.3f}" for b, v in enumerate(fesc_vals))
 
-            # HOD calibration summary (logged once per snapshot)
-            hod_cal   = graph.hod_calibration
-            bias_info = " ".join(
-                f"b{b}={hod_cal.hod_params['bias'][b]:.1f}"
-                for b in range(len(hod_cal.bin_labels))
-            )
+            # For many bins show min/mean/max; for ≤4 bins show all values
+            if n_bins <= 4:
+                fesc_str = " ".join(f"fesc[{b}]={v:.3f}" for b, v in enumerate(fesc_vals))
+            else:
+                fmin = min(fesc_vals); fmax = max(fesc_vals)
+                fmean = sum(fesc_vals) / n_bins
+                fesc_str = (f"fesc min={fmin:.3f} mean={fmean:.3f} max={fmax:.3f} "
+                            f"[{' '.join(f'{v:.2f}' for v in fesc_vals)}]")
 
             print(
                 f"Epoch {epoch:4d}/{n_epochs} | "
@@ -145,7 +159,7 @@ def train(
                 f"<x_pred>={x_pred_mean:.3f} ξ={xi_last:.3f} | "
                 f"α={phys.get('alpha_nH_scale', 0):.3f} J̄={j_scale_val:.2e} | "
                 f"R={phys.get('R_bub', 0):.2f} λ={phys.get('lambda_mfp', 0):.2f} | "
-                f"{fesc_str} | HOD[{bias_info}] | {dt:.1f}s"
+                f"{fesc_str} | {dt:.1f}s"
             )
 
     # Save

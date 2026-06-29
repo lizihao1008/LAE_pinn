@@ -8,7 +8,7 @@ data:
   box_size_mpc: 160.0                 # cMpc/h
   grid_full: 512
   grid_mvp: 64                        # downsampled working resolution
-  muv_cut: -17.5                      # observed-only LAE threshold
+  muv_cut: -19.0                      # observed-only LAE threshold
   tigm_key: "TIGM"                    # Lobs/Lint
 
 graph:
@@ -59,10 +59,13 @@ unresolved_sources:
   # HOD-based faint source model.  Basis fields are pre-computed once before
   # training from the halo catalog (simulation) or ACF-fitted HOD (observations).
   # Only f_esc per mass bin is learned during training.
-  n_hod_bins: 3                       # number of faint-halo M_UV bins
-  muv_det: -17.5                      # detection threshold (M_UV < muv_det = detected)
-  muv_bin_edges: [-17.5, -16.5, -15.0]  # M_UV edges for faint bins; last bin open-ended
-  bin_labels: [near_thresh, intermediate, faint]
+  #
+  # Bin edges are generated dynamically from data.muv_cut to -15.0 in 0.5 mag steps
+  # by run_mvp.py (and other runners), so n_hod_bins here is informational only —
+  # the actual value is len(arange(muv_cut, -15.0, 0.5)).
+  # For muv_cut=-19: edges [-19, -18.5, ..., -15] → 9 bins.
+  muv_faint_limit: -15.0              # faintest bin edge (simulation has no halos below)
+  muv_bin_step: 0.5                   # step size in mag between HOD bins
   smoothness_weight: 1.0e-3           # TV prior on ε_unres (in loss.py)
   # ── Observations interface ───────────────────────────────────────────────
   # Set hod_from_observations.enabled: true when applying to real data.
