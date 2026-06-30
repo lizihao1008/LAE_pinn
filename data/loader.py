@@ -11,7 +11,7 @@ Snapshot directory layout (relative to sim_root):
         Observed_Llya.npy       (N,)
         Intrinsic_REW.npy       (N,)
         Observed_REW.npy        (N,)
-        Peculiar_velocity_halo.npy (N, 3) km/s
+        Peculiar_velocity_halo.npy (N,) km/s along LOS (or (N,3) if available)
         Xbox_grid_017_512.npy   (512,512,512) ionization fraction x_i
         Dbox_grid_017_512.npy   (512,512,512) matter density contrast
 
@@ -48,7 +48,7 @@ class SimSnapshot:
     lya_obs: np.ndarray                 # (N,) observed Lyα luminosity
     rew_int: np.ndarray                 # (N,) intrinsic REW
     rew_obs: np.ndarray                 # (N,) observed REW
-    pec_vel: np.ndarray                 # (N, 3) km/s
+    pec_vel: np.ndarray                 # (N,) or (N, 3) km/s
 
     # Derived
     tigm: np.ndarray                    # (N,) = lya_obs / lya_int
@@ -136,7 +136,7 @@ def load_snapshot(
     lya_obs  = _load("Observed_Llya.npy")          # (N,)
     rew_int  = _load("Intrinsic_REW.npy")          # (N,)
     rew_obs  = _load("Observed_REW.npy")           # (N,)
-    pec_vel  = _load("Peculiar_velocity_halo.npy") # (N, 3)
+    pec_vel  = _load("Peculiar_velocity_halo.npy") # (N,) LOS km/s, or (N,3)
     xbox     = _load("Xbox_grid_017_512.npy")      # (512,512,512)
 
     # Luminosities: clip negative values (numerical noise from RT output)

@@ -504,14 +504,29 @@ def _redshift_space_pos_norm(pos, pec_vel, box, z, los_axis, cosmo):
     """
     Map comoving positions [cMpc/h] to REDSHIFT-SPACE normalised coords [0,1).
 
-    s_los = r_los + v_pec_los (1+z) / H(z),  H(z)=100 E(z) [(km/s)/(cMpc/h)].
+    s_los = r_los + v_pec_los (1+z) / H(z),  H(z)=100 h E(z) [(km/s)/(cMpc/h)].
     If pec_vel is None, returns the real-space normalised positions.
+
+    pec_vel may be (N,) LOS speed [km/s] (Sherwood-Relics format) or (N, 3).
     """
     Om0, Ov0, h0, sig8, ns = cosmo
     p = (np.asarray(pos, dtype=np.float64) / box)
     if pec_vel is not None:
         Ez = np.sqrt(Om0 * (1.0 + z) ** 3 + Ov0)
-        d_los = np.asarray(pec_vel)[:, los_axis] * (1.0 + z) / (100.0 * Ez)   # cMpc/h
+        v = np.asarray(pec_vel, dtype=np.float64)
+        if v.ndim == 1:
+            v_los = v
+        elif v.ndim == 2 and v.shape[1] == 3:
+            v_los = v[:, los_axis]
+        else:
+            raise ValueError(
+                f"pec_vel must have shape (N,) or (N, 3), got {v.shape}"
+            )
+        if v_los.shape[0] != p.shape[0]:
+            raise ValueError(
+                f"pec_vel length {v_los.shape[0]} != n_halos {p.shape[0]}"
+            )
+        d_los = v_los * (1.0 + z) / (100.0 * Ez)   # cMpc/h  (h cancels in H_eff)
         p = p.copy()
         p[:, los_axis] = p[:, los_axis] + d_los / box
     return p % 1.0
