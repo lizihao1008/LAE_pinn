@@ -200,6 +200,27 @@ def main():
     with open(os.path.join(args.save_dir, "eval_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
+    train_config = {
+        "redshift": redshift,
+        "patch_grid": patch_grid,
+        "patch_box_mpc": patch_box,
+        "muv_cut": args.muv_cut,
+        "muv_bin_edges": muv_bin_edges,
+        "n_hod_bins": n_hod_bins,
+        "excursion": args.excursion,
+        "unresolved": args.unresolved,
+        "profile_source": args.profile_source,
+        "dv_max": args.dv_max,
+        "n_lae_mass_bins": args.n_lae_mass_bins,
+        "k_neighbors": args.k_neighbors,
+        "r_link": args.r_link,
+        "sim_root": args.sim_root,
+        "patch_dir": args.patch_dir,
+        "feature_stats": {k: list(v) for k, v in feat_stats.items()},
+    }
+    with open(os.path.join(args.save_dir, "train_config.json"), "w") as f:
+        json.dump(train_config, f, indent=2)
+
     print(f"\nDone.  Results in {args.save_dir}/")
 
 

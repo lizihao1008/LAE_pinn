@@ -55,6 +55,20 @@ kernel:
   A_geom_init: 0.5                    # geom weight before softmax
   A_trans_init: 0.5                   # trans weight before softmax
 
+# Field generator for the ionization field (observed-source term):
+#   continuous (default) — resolution-free kernel sum J_obs(x)=Σ_i w_i K(|x-x_i|)
+#                          rendered on the grid with EXACT source positions; removes
+#                          the trilinear voxel smearing of scatter+FFT and lets you
+#                          query x_HII at arbitrary coordinates (model.continuous_field()).
+#   grid                 — legacy trilinear scatter + FFT convolution.
+# Identical on-grid for on-grid sources; A_obs / J_ref calibration unchanged.
+# (Bubble excursion always uses the scatter path; continuous SDF variant is future work.)
+field_generator: continuous
+continuous_field:
+  generator: continuous     # "continuous" | "grid"  (overrides field_generator if set)
+  r_cut_mpc: 50           # optional cutoff (cMpc/h) for the kernel sum; null = full sum
+  chunk: 4096               # query-point chunk size (memory control)
+
 unresolved_sources:
   # HOD-based faint source model.  Basis fields are pre-computed once before
   # training from the halo catalog (simulation) or ACF-fitted HOD (observations).

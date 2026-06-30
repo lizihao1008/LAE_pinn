@@ -27,11 +27,17 @@ try:
     from ..physics.scatter import scatter_to_grid, fft_convolve_3d
     from ..physics.unresolved_sources import HODUnresolvedField
     from ..physics.excursion_set import ExcursionSetMapping, BubbleExcursionSet
+    from ..physics.continuous_field import (
+        render_obs_field_on_grid, render_bubble_on_grid, calibrate_bubble_zeta,
+    )
 except ImportError:  # python -m experiments.run_mvp with project root on sys.path
     from physics.kernels import MixtureKernel, build_kernel, make_3d_kernel_grid
     from physics.scatter import scatter_to_grid, fft_convolve_3d
     from physics.unresolved_sources import HODUnresolvedField
     from physics.excursion_set import ExcursionSetMapping, BubbleExcursionSet
+    from physics.continuous_field import (
+        render_obs_field_on_grid, render_bubble_on_grid, calibrate_bubble_zeta,
+    )
 from .gnn_encoder import build_gnn_encoder
 from .source_head import SourceHead
 
@@ -81,12 +87,27 @@ class LAEPINN(nn.Module):
         # Grid
         grid_size: int = 64,
         box_size: float = 160.0,
+        # Field generator: how the observed-source radiation field J_obs is built.
+        #   "continuous" : kernel-sum  J_obs(x)=Σ_i w_i K(|x-x_i|) rendered on the
+        #                  grid with EXACT source positions (no trilinear voxel
+        #                  smearing); also queryable at arbitrary coordinates.
+        #   "grid"       : legacy trilinear scatter + FFT convolution.
+        # Identical on-grid for on-grid sources; A_obs/J_ref calibration unchanged
+        # (the unit-sum kernel preserves spatial means).  Supports BOTH cores: the
+        # bubble core uses per-scale top-hat kernel sums for the observed sources
+        # (mesh-free) while S_unres / n_H are grid-smoothed and interpolated.
+        field_generator: str = "continuous",
+        continuous_r_cut_mpc: float | None = None,
+        continuous_chunk: int = 4096,
     ):
         super().__init__()
 
         self.grid_size = grid_size
         self.box_size  = box_size
         self.los_axis  = los_axis
+        self.field_generator = field_generator
+        self.cf_r_cut = continuous_r_cut_mpc
+        self.cf_chunk = continuous_chunk
 
         # --- GNN encoder ---
         self.gnn = build_gnn_encoder(
@@ -257,71 +278,119 @@ class LAEPINN(nn.Module):
         else:
             pos_scatter = graph.pos
 
-        # 3. Build 3D kernel on grid (uses current learnable parameters)
+        # 3. Build 3D kernel on grid (uses current learnable parameters).
+        #    Still needed for the unresolved (diffuse) FFT convolution, and for the
+        #    legacy grid generator.
         kernel_grid = make_3d_kernel_grid(self.kernel, G, self.box_size, device)
 
-        # 4. Scatter LAE sources onto grid — source density, NOT radiation field yet.
-        #    S_obs(x) = Σ_i w_i δ³(x - x̃_i)
-        S_obs = scatter_to_grid(pos_scatter, w_eff, G)   # (G, G, G)
-
-        # 5. Unresolved source density: S_unres(x) = Σ_b f_esc_b · ε_b(x)
+        # 4. Unresolved source density: S_unres(x) = Σ_b f_esc_b · ε_b(x)
         #    ε_b(x) = 1 + b_b δ_dm(x) is the fixed HOD basis; only f_esc_b learned.
         S_unres = self.unresolved(hod_basis)              # (G, G, G)
 
-        # 6. Convolve TOTAL source density with the radiative kernel K(r; θ_K).
-        #        J_total(x) = (A_obs · S_obs + S_unres) * K        [K sums to 1]
-        #
-        #    A_obs balances the sparse LAE term against the HOD background so
-        #    both contribute meaningfully.  Its base value is calibrated ONCE
-        #    (mean(S_unres)/mean(S_obs) on the first batch) and then held fixed;
-        #    _log_A_obs is the learnable deviation on top.
-        #
-        #    Crucial: the base is FIXED, not a per-step detached ratio.  A
-        #    per-step detached ratio re-tracks every change in mean(S_obs)/
-        #    mean(S_unres), which (a) cancels the photon-budget signal in the
-        #    forward and (b) is invisible to autograd, producing a spurious
-        #    common-mode gradient that collapses all f_esc bins to one value.
-        if not bool(self._amp_calibrated):
-            with torch.no_grad():
-                s_obs_m = S_obs.mean().clamp(min=1e-12)
-                s_unr_m = S_unres.mean().clamp(min=1e-12)
-                self._A_obs_base.copy_(s_unr_m / s_obs_m)
+        use_continuous = (self.field_generator == "continuous"
+                          and self.excursion_type != "bubble")
 
-        A_obs   = self._A_obs_base * torch.exp(self._log_A_obs)   # learnable scale
-        S_emiss = A_obs * S_obs + S_unres        # total ionizing emissivity (pre-propagation)
+        # A_obs balances the sparse LAE term against the HOD background.  Its base
+        # is calibrated ONCE (mean(S_unres)/mean(S_obs) on the first batch) then
+        # held fixed; _log_A_obs is the learnable deviation.  The base is FIXED,
+        # not a per-step detached ratio (which would cancel the photon-budget
+        # signal and collapse all f_esc bins via a spurious common-mode gradient).
 
-        # 7. emissivity → x_HII
-        if self.excursion_type == "bubble":
-            # Excursion-set bubble model does its OWN multi-scale smoothing, so
-            # the single mixture kernel is bypassed here.  A cell is ionized if
-            # the smoothed photon/H ratio exceeds 1 on any scale → sharp 0/1
-            # topology with genuine neutral voids (x_HII → 0).
-            J_total    = S_emiss                  # expose emissivity for diagnostics
+        if self.field_generator == "continuous" and self.excursion_type == "bubble":
+            # ---- Continuous bubble generator (top-hat excursion-set, mesh-free obs) ----
+            #   Observed sources enter each scale's top-hat smoothing as an EXACT
+            #   kernel sum (no scatter voxel smearing); S_unres and n_H are smoothed
+            #   on the grid (reusing the bubble's top-hat buffers) and interpolated.
+            #   A_obs uses emissivity means; the observed mean is analytic
+            #   (Σ w_eff / G³ == scatter S_obs.mean()), so calibration matches the
+            #   grid bubble path without scattering.
             if not bool(self._amp_calibrated):
                 with torch.no_grad():
-                    self._J_ref.copy_(S_emiss.mean().clamp(min=1e-12))
-                    # Start <x_HII> near the target ionized fraction so the
-                    # global_xHII gradient is not saturated at init.
+                    s_obs_m = (w_eff.sum() / float(G ** 3)).clamp(min=1e-12)
+                    s_unr_m = S_unres.mean().clamp(min=1e-12)
+                    self._A_obs_base.copy_(s_unr_m / s_obs_m)
+            A_obs = self._A_obs_base * torch.exp(self._log_A_obs)
+            if not bool(self._amp_calibrated):
+                with torch.no_grad():
                     tgt = float(getattr(graph, "xi_global", 0.5))
-                    self.excursion.calibrate_zeta(S_emiss, density_grid, target=tgt)
+                    calibrate_bubble_zeta(
+                        self.excursion, pos_scatter, w_eff, A_obs, S_unres,
+                        density_grid, self.box_size, target=tgt,
+                    )
+                    # diagnostic emissivity scale (bubble x_HII does not use J_ref)
+                    self._J_ref.copy_((w_eff.sum() / float(G ** 3)).clamp(min=1e-12))
                     self._amp_calibrated.fill_(True)
-            x_hii_pred = self.excursion(S_emiss, density=density_grid)
+            x_hii_pred = render_bubble_on_grid(
+                self.excursion, pos_scatter, w_eff, A_obs, S_unres,
+                density_grid, self.box_size, grid_size=G, chunk=self.cf_chunk,
+            )
             J_ref = self._J_ref
-        else:
-            # Photoionization equilibrium on the kernel-propagated field J.
-            # Normalise J by a FIXED reference (calibrated once on the first
-            # batch) instead of its per-step spatial mean, so amplitude changes
-            # from the sources propagate to <x_HII> (see the calibration note in
-            # __init__).
-            J_total = fft_convolve_3d(S_emiss, kernel_grid)   # (G, G, G)
+            # diagnostics only (NOT used for x_HII): emissivity grid via cheap scatter
+            S_obs = scatter_to_grid(pos_scatter, w_eff, G)
+            J_total = A_obs * S_obs + S_unres
+            S_obs_scale = (w_eff.sum() / float(G ** 3)).detach()
+        elif use_continuous:
+            # ---- Continuous generator: J_obs(x)=Σ_i w_i K(|x-x_i|) on the grid ----
+            #   Drop-in for scatter_to_grid + fft_convolve_3d of the observed term,
+            #   but with EXACT source positions (no trilinear voxel smearing).  The
+            #   unit-sum kernel preserves means, so mean(J_obs_grid)=mean(S_obs)
+            #   and mean(J_unres_grid)=mean(S_unres): the A_obs / J_ref calibration
+            #   is bit-for-bit the same as the grid path.  By linearity
+            #   J_total = A_obs·(S_obs*K) + (S_unres*K) = A_obs·J_obs_grid + J_unres_grid.
+            J_obs_grid   = render_obs_field_on_grid(
+                self.kernel, pos_scatter, w_eff, G, self.box_size,
+                r_cut_mpc=self.cf_r_cut, chunk=self.cf_chunk,
+            )                                              # (G,G,G) observed radiation field
+            J_unres_grid = fft_convolve_3d(S_unres, kernel_grid)
+            if not bool(self._amp_calibrated):
+                with torch.no_grad():
+                    self._A_obs_base.copy_(
+                        J_unres_grid.mean().clamp(min=1e-12)
+                        / J_obs_grid.mean().clamp(min=1e-12)
+                    )
+            A_obs   = self._A_obs_base * torch.exp(self._log_A_obs)
+            J_total = A_obs * J_obs_grid + J_unres_grid
             if not bool(self._amp_calibrated):
                 with torch.no_grad():
                     self._J_ref.copy_(J_total.mean().clamp(min=1e-12))
                     self._amp_calibrated.fill_(True)
-            J_ref      = self._J_ref
-            x_hii_pred = self.excursion(J_total / J_ref)
+            J_ref       = self._J_ref
+            x_hii_pred  = self.excursion(J_total / J_ref)
+            S_obs       = J_obs_grid                       # obs radiation field (diagnostics)
+            S_obs_scale = J_obs_grid.mean().detach()
+        else:
+            # ---- Legacy grid generator (trilinear scatter + FFT) / bubble path ----
+            S_obs = scatter_to_grid(pos_scatter, w_eff, G)   # (G, G, G) source density
+            if not bool(self._amp_calibrated):
+                with torch.no_grad():
+                    s_obs_m = S_obs.mean().clamp(min=1e-12)
+                    s_unr_m = S_unres.mean().clamp(min=1e-12)
+                    self._A_obs_base.copy_(s_unr_m / s_obs_m)
+            A_obs   = self._A_obs_base * torch.exp(self._log_A_obs)
+            S_emiss = A_obs * S_obs + S_unres        # total emissivity (pre-propagation)
 
-        S_obs_scale = S_obs.mean().detach()   # for diagnostics only
+            if self.excursion_type == "bubble":
+                # Bubble model does its OWN multi-scale smoothing; the mixture
+                # kernel is bypassed.  Sharp 0/1 topology with genuine voids.
+                J_total = S_emiss
+                if not bool(self._amp_calibrated):
+                    with torch.no_grad():
+                        self._J_ref.copy_(S_emiss.mean().clamp(min=1e-12))
+                        tgt = float(getattr(graph, "xi_global", 0.5))
+                        self.excursion.calibrate_zeta(S_emiss, density_grid, target=tgt)
+                        self._amp_calibrated.fill_(True)
+                x_hii_pred = self.excursion(S_emiss, density=density_grid)
+                J_ref = self._J_ref
+            else:
+                J_total = fft_convolve_3d(S_emiss, kernel_grid)   # (G, G, G)
+                if not bool(self._amp_calibrated):
+                    with torch.no_grad():
+                        self._J_ref.copy_(J_total.mean().clamp(min=1e-12))
+                        self._amp_calibrated.fill_(True)
+                J_ref      = self._J_ref
+                x_hii_pred = self.excursion(J_total / J_ref)
+
+            S_obs_scale = S_obs.mean().detach()   # for diagnostics only
 
         out = {
             "x_hii_pred":  x_hii_pred,
@@ -372,6 +441,25 @@ class LAEPINN(nn.Module):
         params["log_A_obs"] = float(self._log_A_obs.item())
         return params
 
+    def continuous_field(self, graph: Data, hod_basis: torch.Tensor,
+                         use_rsd_correction: bool = True):
+        """
+        Off-grid interface: returns ``(evaluator, ctx)`` so that
+        ``evaluator.forward(query, **ctx)["x_hii"]`` evaluates x_HII at ARBITRARY
+        coordinates (e.g. exact LAE positions for MCF marks, sightlines, or a
+        higher-resolution grid), consistent with ``forward`` on the grid.
+
+        Supports BOTH cores: equilibrium (kernel-integral field) and bubble
+        (top-hat excursion-set).  See
+        ``physics.continuous_field.build_continuous_field_from_pinn``.
+        """
+        try:
+            from ..physics.continuous_field import build_continuous_field_from_pinn
+        except ImportError:
+            from physics.continuous_field import build_continuous_field_from_pinn
+        return build_continuous_field_from_pinn(self, graph, hod_basis,
+                                                use_rsd_correction=use_rsd_correction)
+
 
 # ------------------------------------------------------------------ #
 #  Ablation variants
@@ -387,6 +475,8 @@ def build_pinn_from_config(cfg: dict) -> LAEPINN:
     data_cfg   = cfg.get("data", {})
 
     rsd_cfg = cfg.get("rsd_correction", {})
+    cf_cfg  = cfg.get("continuous_field", {})
+    field_generator = cf_cfg.get("generator", cfg.get("field_generator", "continuous"))
     return LAEPINN(
         gnn_architecture=gnn_cfg.get("architecture", "GATv2Conv"),
         gnn_in_channels=len(cfg.get("graph", {}).get("node_features", range(8))),
@@ -416,4 +506,7 @@ def build_pinn_from_config(cfg: dict) -> LAEPINN:
         bubble_radii_mpc=exc_cfg.get("bubble_radii_mpc", None),
         grid_size=data_cfg.get("grid_mvp", 64),
         box_size=data_cfg.get("box_size_mpc", 160.0),
+        field_generator=field_generator,
+        continuous_r_cut_mpc=cf_cfg.get("r_cut_mpc", None),
+        continuous_chunk=cf_cfg.get("chunk", 4096),
     )

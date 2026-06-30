@@ -55,6 +55,12 @@ def parse_args():
                         "conditional = COF-ACF stack of faint excess around LAEs (voids -> 0)")
     p.add_argument("--excursion", choices=["equilibrium", "bubble"], default="equilibrium",
                    help="equilibrium = smooth x(J); bubble = excursion-set threshold (sharp 0/1)")
+    p.add_argument("--field_generator", choices=["continuous", "grid"], default="continuous",
+                   help="observed-source field generator. continuous (default) = mesh-free "
+                        "kernel/top-hat sum over EXACT source positions (removes scatter voxel "
+                        "smearing, queryable off-grid); supports BOTH equilibrium and bubble "
+                        "cores. grid = legacy scatter+FFT. Continuous bubble costs ~n_scales×(G³·N) "
+                        "per step; use --field_generator grid to fall back if needed.")
     p.add_argument("--dv_max", type=float, default=1000.0,
                    help="LOS redshift-space window [km/s] for conditional profiles")
     p.add_argument("--n_lae_mass_bins", type=int, default=4,
@@ -203,8 +209,12 @@ def main():
         box_size=snap.box_size,
         excursion_type=args.excursion,
         alpha_nH_scale_init=alpha_init,
+        field_generator=args.field_generator,
     )
     print(f"  Ionization core: {args.excursion}")
+    print(f"  Field generator: {args.field_generator}"
+          + ("  (mesh-free; ~n_scales×G³·N per step for bubble)"
+             if args.field_generator == "continuous" and args.excursion == "bubble" else ""))
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Trainable parameters: {n_params:,}")
 
