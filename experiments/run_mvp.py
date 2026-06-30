@@ -49,6 +49,18 @@ def parse_args():
     p.add_argument("--r_link",     type=float, default=15.0)
     p.add_argument("--subsample",  type=int, default=None,
                    help="Subsample N halos for speed (None = use all)")
+    # --- unresolved-source model + ionization core ---
+    p.add_argument("--unresolved", choices=["linear", "conditional"], default="linear",
+                   help="linear = (1+b*delta) bias field; "
+                        "conditional = COF-ACF stack of faint excess around LAEs (voids -> 0)")
+    p.add_argument("--excursion", choices=["equilibrium", "bubble"], default="equilibrium",
+                   help="equilibrium = smooth x(J); bubble = excursion-set threshold (sharp 0/1)")
+    p.add_argument("--dv_max", type=float, default=1000.0,
+                   help="LOS redshift-space window [km/s] for conditional profiles")
+    p.add_argument("--n_lae_mass_bins", type=int, default=4,
+                   help="number of LAE halo-mass bins for the conditional stack")
+    p.add_argument("--no_cof", action="store_true",
+                   help="use power-law xi(r) fallback instead of COF_tools HOD CCF")
     return p.parse_args()
 
 
@@ -108,17 +120,38 @@ def main():
     print(f"  HOD bins: {n_hod_bins} bins from MUV={muv_bin_edges[0]:.1f} "
           f"to MUV={muv_bin_edges[-1]:.1f} (step {muv_bin_step} mag)")
 
-    # HOD calibration on the FULL halo catalog (faint halos must be present)
-    hod_calibration = build_hod_basis_from_simulation(
-        snap_full,
-        muv_det       = args.muv_cut,
-        muv_bin_edges = muv_bin_edges,
-        grid_size     = args.grid,
-    )
-    bias_str = "  ".join(f"b{b}={hod_calibration.hod_params['bias'][b]:.2f}"
-                         f"(N={hod_calibration.hod_params['N_halos'][b]})"
-                         for b in range(len(hod_calibration.bin_labels)))
-    print(f"  HOD: {bias_str}")
+    # HOD calibration. Two unresolved-source models:
+    #   linear      — global (1+b*delta) bias field (keeps voids bright)
+    #   conditional — COF-ACF stack of faint excess around observed LAEs
+    #                 (voids -> 0, removes the x_HII floor)
+    if args.unresolved == "conditional":
+        from data.conditional_basis import build_conditional_unresolved_basis
+        print(f"  Unresolved model: conditional ACF stack "
+              f"(dv_max={args.dv_max:.0f} km/s, "
+              f"{'power-law xi' if args.no_cof else 'COF HOD CCF'})")
+        hod_calibration = build_conditional_unresolved_basis(
+            snap,                                  # observed LAEs (graph nodes)
+            muv_bin_edges   = muv_bin_edges,
+            grid_size       = args.grid,
+            n_lae_mass_bins = args.n_lae_mass_bins,
+            dv_max_kms      = args.dv_max,
+            use_cof         = not args.no_cof,
+            snap_full       = snap_full,
+            muv_det         = args.muv_cut,
+        )
+        print(f"  Conditional bins: {len(hod_calibration.bin_labels)}  "
+              f"(<L_b> and <N_b|M> measured per bin)")
+    else:
+        hod_calibration = build_hod_basis_from_simulation(
+            snap_full,
+            muv_det       = args.muv_cut,
+            muv_bin_edges = muv_bin_edges,
+            grid_size     = args.grid,
+        )
+        bias_str = "  ".join(f"b{b}={hod_calibration.hod_params['bias'][b]:.2f}"
+                             f"(N={hod_calibration.hod_params['N_halos'][b]})"
+                             for b in range(len(hod_calibration.bin_labels)))
+        print(f"  HOD: {bias_str}")
 
     stats = compute_feature_stats([snap])
     snap_dict = prepare_snapshot(snap, stats, grid_size=args.grid, device=device,
@@ -130,6 +163,14 @@ def main():
     graph = build_graph_from_snapshot(snap_dict, k=args.k_neighbors,
                                        r_max=args.r_link, subsample=subsample)
     print(f"  Nodes: {graph.num_nodes}, Edges: {graph.num_edges}")
+
+    # Attach the gas-density grid n_H ∝ (1+δ) for the bubble core (optional;
+    # the equilibrium core ignores it).  Downsampled from the native 512³ field.
+    if args.excursion == "bubble" and snap.dbox_512 is not None:
+        from data.preprocessing import downsample_grid
+        dens = downsample_grid(snap.dbox_512, args.grid)         # δ (contrast)
+        dens = np.clip(1.0 + dens, 0.0, None)                    # n_H ∝ (1+δ)
+        graph.density_grid = torch.from_numpy(dens.astype(np.float32)).to(device)
 
     # ---- 4. Model ----
     print("Initialising LAEPINN...")
@@ -158,8 +199,10 @@ def main():
         n_hod_bins=n_hod_bins,
         grid_size=args.grid,
         box_size=snap.box_size,
+        excursion_type=args.excursion,
         alpha_nH_scale_init=alpha_init,
     )
+    print(f"  Ionization core: {args.excursion}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Trainable parameters: {n_params:,}")
 
@@ -193,7 +236,8 @@ def main():
     graph = graph.to(device)
 
     with torch.no_grad():
-        out = model(graph, hod_basis=graph.hod_basis, return_intermediates=True)
+        out = model(graph, hod_basis=graph.hod_basis, return_intermediates=True,
+                    density_grid=getattr(graph, "density_grid", None))
 
     x_pred_np = out["x_hii_pred"].cpu().numpy()
     x_true_np = graph.xbox_true.squeeze().cpu().numpy()

@@ -95,6 +95,7 @@ def train(
                 # xi_global not passed: no binary-search calibration.
                 # alpha_nH_scale is trained via the global_xHII loss instead.
                 return_intermediates=True,
+                density_grid=getattr(graph, "density_grid", None),   # used by bubble core
             )
 
             x_true = graph.xbox_true.squeeze()  # (G, G, G)
@@ -138,7 +139,8 @@ def train(
             model.eval()
             with torch.no_grad():
                 last_out    = model(graph, hod_basis=graph.hod_basis,
-                                    return_intermediates=True)
+                                    return_intermediates=True,
+                                    density_grid=getattr(graph, "density_grid", None))
                 x_pred      = last_out["x_hii_pred"]
                 x_pred_mean = float(x_pred.mean().item())
                 x_pred_std  = float(x_pred.std().item())   # spatial contrast: 0 = uniform

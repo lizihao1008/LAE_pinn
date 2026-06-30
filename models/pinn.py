@@ -26,12 +26,12 @@ try:
     from ..physics.kernels import MixtureKernel, build_kernel, make_3d_kernel_grid
     from ..physics.scatter import scatter_to_grid, fft_convolve_3d
     from ..physics.unresolved_sources import HODUnresolvedField
-    from ..physics.excursion_set import ExcursionSetMapping
+    from ..physics.excursion_set import ExcursionSetMapping, BubbleExcursionSet
 except ImportError:  # python -m experiments.run_mvp with project root on sys.path
     from physics.kernels import MixtureKernel, build_kernel, make_3d_kernel_grid
     from physics.scatter import scatter_to_grid, fft_convolve_3d
     from physics.unresolved_sources import HODUnresolvedField
-    from physics.excursion_set import ExcursionSetMapping
+    from physics.excursion_set import ExcursionSetMapping, BubbleExcursionSet
 from .gnn_encoder import build_gnn_encoder
 from .source_head import SourceHead
 
@@ -68,9 +68,16 @@ class LAEPINN(nn.Module):
         kernel_lambda_mfp_init: float = 20.0,
         # Unresolved sources (HOD-based)
         n_hod_bins: int = 3,
-        # Ionization equilibrium  A = J / alpha_nH_scale
+        # Ionization mapping  J -> x_HII
+        #   "equilibrium" : smooth photoionization equilibrium x(A), A=J/alpha_nH_scale
+        #   "bubble"      : excursion-set bubble/threshold (sharp 0/1 topology,
+        #                   x_HII -> 0 in voids; needed to reach near-zero x_HII)
+        excursion_type: str = "equilibrium",
         alpha_nH_scale_init: float = 1.0,
         excursion_learnable: bool = True,
+        bubble_zeta_init: float = 1.0,
+        bubble_sharpness_init: float = 6.0,
+        bubble_radii_mpc: list[float] | None = None,
         # Grid
         grid_size: int = 64,
         box_size: float = 160.0,
@@ -164,14 +171,29 @@ class LAEPINN(nn.Module):
         self.register_buffer("_A_obs_base", torch.tensor(1.0))
         self.register_buffer("_J_ref", torch.tensor(1.0))
 
-        # --- Ionization equilibrium ---
-        # Photoionization balance Γ(1−x)n_H = α n_e n_p  →  x_HII(J) via A=J/s.
-        # Single learnable s absorbs recombination coeff α and mean density n_H
-        # (neither is directly observable at z~7).
-        self.excursion = ExcursionSetMapping(
-            alpha_nH_scale_init=alpha_nH_scale_init,
-            learnable=excursion_learnable,
-        )
+        # --- Ionization mapping  J -> x_HII ---
+        self.excursion_type = excursion_type
+        if excursion_type == "bubble":
+            # Excursion-set bubble model: a cell is ionized if the smoothed
+            # photon/H ratio exceeds 1 on ANY scale.  Produces sharp 0/1 topology
+            # and genuine neutral islands (x_HII -> 0), unlike the smooth
+            # equilibrium which floors x_HII well above 0.
+            self.excursion = BubbleExcursionSet(
+                grid_size=grid_size,
+                box_size=box_size,
+                radii_mpc=bubble_radii_mpc,
+                zeta_init=bubble_zeta_init,
+                sharpness_init=bubble_sharpness_init,
+                learnable=excursion_learnable,
+            )
+        else:
+            # Photoionization balance Γ(1−x)n_H = α n_e n_p  →  x_HII(J) via A=J/s.
+            # Single learnable s absorbs recombination coeff α and mean density n_H
+            # (neither is directly observable at z~7).
+            self.excursion = ExcursionSetMapping(
+                alpha_nH_scale_init=alpha_nH_scale_init,
+                learnable=excursion_learnable,
+            )
 
     def forward(
         self,
@@ -179,6 +201,7 @@ class LAEPINN(nn.Module):
         hod_basis: torch.Tensor,        # (n_bins, G, G, G)
         xi_global: float | None = None,
         return_intermediates: bool = False,
+        density_grid: torch.Tensor | None = None,   # (G,G,G) gas density ~ (1+δ), for bubble core
     ) -> dict[str, torch.Tensor]:
         """
         Parameters
@@ -265,27 +288,40 @@ class LAEPINN(nn.Module):
                 self._A_obs_base.copy_(s_unr_m / s_obs_m)
 
         A_obs   = self._A_obs_base * torch.exp(self._log_A_obs)   # learnable scale
-        J_total = fft_convolve_3d(A_obs * S_obs + S_unres, kernel_grid)   # (G, G, G)
+        S_emiss = A_obs * S_obs + S_unres        # total ionizing emissivity (pre-propagation)
 
-        # 7. J → x_HII via photoionization equilibrium.
-        #    Normalise J by a FIXED reference (calibrated once on the first
-        #    batch) instead of its per-step spatial mean.  A fixed reference
-        #    keeps the units sane at init — mean(J/J_ref)=1 → A=1/alpha≈A_target
-        #    → mean(x_pred)≈xi — WITHOUT cancelling amplitude information every
-        #    step.  With the old per-step detached J_scale, mean(J/J_scale) was
-        #    forced to 1 on every forward, so <x_HII> was controlled solely by
-        #    alpha_nH_scale and the field could never leave the low-contrast,
-        #    near-uniform small-A regime.  With a fixed reference, stronger
-        #    sources raise both <x_HII> and the spatial contrast, as physics
-        #    requires.
-        if not bool(self._amp_calibrated):
-            with torch.no_grad():
-                self._J_ref.copy_(J_total.mean().clamp(min=1e-12))
-                self._amp_calibrated.fill_(True)
+        # 7. emissivity → x_HII
+        if self.excursion_type == "bubble":
+            # Excursion-set bubble model does its OWN multi-scale smoothing, so
+            # the single mixture kernel is bypassed here.  A cell is ionized if
+            # the smoothed photon/H ratio exceeds 1 on any scale → sharp 0/1
+            # topology with genuine neutral voids (x_HII → 0).
+            J_total    = S_emiss                  # expose emissivity for diagnostics
+            if not bool(self._amp_calibrated):
+                with torch.no_grad():
+                    self._J_ref.copy_(S_emiss.mean().clamp(min=1e-12))
+                    # Start <x_HII> near the target ionized fraction so the
+                    # global_xHII gradient is not saturated at init.
+                    tgt = float(getattr(graph, "xi_global", 0.5))
+                    self.excursion.calibrate_zeta(S_emiss, density_grid, target=tgt)
+                    self._amp_calibrated.fill_(True)
+            x_hii_pred = self.excursion(S_emiss, density=density_grid)
+            J_ref = self._J_ref
+        else:
+            # Photoionization equilibrium on the kernel-propagated field J.
+            # Normalise J by a FIXED reference (calibrated once on the first
+            # batch) instead of its per-step spatial mean, so amplitude changes
+            # from the sources propagate to <x_HII> (see the calibration note in
+            # __init__).
+            J_total = fft_convolve_3d(S_emiss, kernel_grid)   # (G, G, G)
+            if not bool(self._amp_calibrated):
+                with torch.no_grad():
+                    self._J_ref.copy_(J_total.mean().clamp(min=1e-12))
+                    self._amp_calibrated.fill_(True)
+            J_ref      = self._J_ref
+            x_hii_pred = self.excursion(J_total / J_ref)
 
-        J_ref       = self._J_ref
         S_obs_scale = S_obs.mean().detach()   # for diagnostics only
-        x_hii_pred  = self.excursion(J_total / J_ref)
 
         out = {
             "x_hii_pred":  x_hii_pred,
@@ -327,7 +363,11 @@ class LAEPINN(nn.Module):
             params.update(self.kernel.get_params_dict())
         # f_esc per HOD mass bin (keys: "fesc_bin0", "fesc_bin1", ...)
         params.update(self.unresolved.get_fesc_dict())
-        params["alpha_nH_scale"] = float(self.excursion.alpha_nH_scale.item())
+        # ionization-mapping parameters (equilibrium: alpha_nH_scale; bubble: zeta, sharpness)
+        if self.excursion_type == "bubble":
+            params.update(self.excursion.get_params_dict())
+        else:
+            params["alpha_nH_scale"] = float(self.excursion.alpha_nH_scale.item())
         # log_A_obs: learnable log-deviation from equi-amplitude for S_obs vs S_unres
         params["log_A_obs"] = float(self._log_A_obs.item())
         return params
@@ -366,10 +406,14 @@ def build_pinn_from_config(cfg: dict) -> LAEPINN:
         kernel_delta_init=ker_cfg.get("delta_init_mpc", 1.0),
         kernel_lambda_mfp_init=ker_cfg.get("lambda_mfp_init_mpc", 20.0),
         n_hod_bins=unr_cfg.get("n_hod_bins", unr_cfg.get("n_populations", 3)),
+        excursion_type=exc_cfg.get("type", "equilibrium"),
         alpha_nH_scale_init=exc_cfg.get(
             "alpha_nH_scale_init",
             exc_cfg.get("alpha_scale_init", exc_cfg.get("sharpness_init", 1.0)),
         ),
+        bubble_zeta_init=exc_cfg.get("zeta_init", 1.0),
+        bubble_sharpness_init=exc_cfg.get("bubble_sharpness_init", 6.0),
+        bubble_radii_mpc=exc_cfg.get("bubble_radii_mpc", None),
         grid_size=data_cfg.get("grid_mvp", 64),
         box_size=data_cfg.get("box_size_mpc", 160.0),
     )

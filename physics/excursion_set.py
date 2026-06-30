@@ -10,9 +10,16 @@ Photoionization-equilibrium mapping: J(x) → x_HII(x).
 
 from __future__ import annotations
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _softplus_inverse(y: torch.Tensor) -> torch.Tensor:
+    """Inverse of softplus: x such that softplus(x) = y (y > 0)."""
+    y = torch.as_tensor(y).clamp(min=1e-8)
+    return torch.log(torch.expm1(y).clamp(min=1e-12))
 
 
 def equilibrium_x_hii(A: torch.Tensor) -> torch.Tensor:
@@ -124,3 +131,150 @@ class ExcursionSetMapping(nn.Module):
 
     def extra_repr(self) -> str:
         return f"alpha_nH_scale={self.alpha_nH_scale.item():.4f}"
+
+
+# ------------------------------------------------------------------ #
+#  Excursion-set BUBBLE mapping (sharp 0/1 reionization topology)
+# ------------------------------------------------------------------ #
+
+def _tophat_kernels(radii_mpc, grid_size, box_size, device):
+    """
+    Build a stack of normalised top-hat smoothing kernels on the grid,
+    rolled so zero-lag is at index [0,0,0] (FFT-ready).
+
+    Returns (n_scales, G, G, G) float32.
+    """
+    G  = grid_size
+    dx = box_size / G
+    coords = (torch.arange(G, device=device, dtype=torch.float32) - G // 2) * dx
+    cx, cy, cz = torch.meshgrid(coords, coords, coords, indexing="ij")
+    r = (cx ** 2 + cy ** 2 + cz ** 2).sqrt()
+    ks = []
+    for R in radii_mpc:
+        k = (r <= float(R)).float()
+        k = k / (k.sum() + 1e-12)
+        k = torch.roll(k, (G // 2, G // 2, G // 2), dims=(0, 1, 2))
+        ks.append(k.contiguous())
+    return torch.stack(ks, dim=0)
+
+
+class BubbleExcursionSet(nn.Module):
+    """
+    Differentiable excursion-set bubble model (Furlanetto-Zaldarriaga-Hernquist
+    style): a cell is ionized if, smoothed on SOME scale R, the cumulative
+    ionizing photons exceed the cumulative neutral hydrogen, i.e.
+
+        Q_R(x) = zeta * <S_emiss>_R(x) / <n_H>_R(x)  >=  1   for some R.
+
+    Differentiable surrogate
+    ------------------------
+        p_R(x) = sigmoid( s * (Q_R(x) - 1) )            soft threshold per scale
+        x_HII(x) = 1 - Prod_R ( 1 - p_R(x) )            ionized if ANY scale wins
+
+    This yields sharp 0/1 topology: cells deep inside ionized regions exceed the
+    threshold on large R (x -> 1); cells in voids fall below threshold on every
+    R (x -> 0).  Unlike the smooth equilibrium x(J), neutral islands (x ~ 0) are
+    naturally produced -- removing the x_HII floor.
+
+    Learnable parameters
+    --------------------
+        zeta  : ionizing efficiency (sets the global ionized fraction; trained
+                by the global_xHII loss).  zeta = softplus(_zeta_raw).
+        s     : threshold sharpness.  s = softplus(_sharp_raw).
+    """
+
+    def __init__(
+        self,
+        grid_size: int = 64,
+        box_size: float = 160.0,
+        radii_mpc: list[float] | None = None,
+        zeta_init: float = 1.0,
+        sharpness_init: float = 6.0,
+        learnable: bool = True,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.box_size  = box_size
+        if radii_mpc is None:
+            # logarithmic scales from ~1 voxel to ~quarter box
+            dx = box_size / grid_size
+            radii_mpc = list(np.geomspace(dx, box_size / 4.0, 6))
+        self.radii_mpc = list(radii_mpc)
+
+        raw_zeta  = math.log(math.expm1(max(zeta_init, 1e-6)))
+        raw_sharp = math.log(math.expm1(max(sharpness_init, 1e-6)))
+        if learnable:
+            self._zeta_raw  = nn.Parameter(torch.tensor(raw_zeta,  dtype=torch.float32))
+            self._sharp_raw = nn.Parameter(torch.tensor(raw_sharp, dtype=torch.float32))
+        else:
+            self.register_buffer("_zeta_raw",  torch.tensor(raw_zeta,  dtype=torch.float32))
+            self.register_buffer("_sharp_raw", torch.tensor(raw_sharp, dtype=torch.float32))
+
+        # Fixed top-hat smoothing kernels (one per scale)
+        self.register_buffer(
+            "_th_kernels",
+            _tophat_kernels(self.radii_mpc, grid_size, box_size, device="cpu"),
+        )
+
+    @property
+    def zeta(self) -> torch.Tensor:
+        return F.softplus(self._zeta_raw) + 1e-8
+
+    @property
+    def sharpness(self) -> torch.Tensor:
+        return F.softplus(self._sharp_raw) + 1e-8
+
+    def forward(
+        self,
+        S_emiss: torch.Tensor,                 # (G,G,G) ionizing source/emissivity field
+        density: torch.Tensor | None = None,   # (G,G,G) gas density ~ (1+delta); default uniform
+    ) -> torch.Tensor:
+        G = self.grid_size
+        S = S_emiss.clamp(min=0.0).float().contiguous()
+        n_H = (density.clamp(min=1e-6).float().contiguous()
+               if density is not None else torch.ones_like(S))
+
+        dims = (-3, -2, -1)
+        S_fft = torch.fft.rfftn(S,   dim=dims)
+        H_fft = torch.fft.rfftn(n_H, dim=dims)
+
+        zeta = self.zeta
+        s    = self.sharpness
+        log_one_minus_p = torch.zeros_like(S)     # accumulate log(1 - p_R)
+        for j in range(self._th_kernels.shape[0]):
+            K_fft = torch.fft.rfftn(self._th_kernels[j], dim=dims)
+            S_bar = torch.fft.irfftn(S_fft * K_fft, s=S.shape, dim=dims).clamp(min=0.0)
+            H_bar = torch.fft.irfftn(H_fft * K_fft, s=S.shape, dim=dims).clamp(min=1e-8)
+            Q = zeta * S_bar / H_bar                       # photon/H ratio at scale R
+            p = torch.sigmoid(s * (Q - 1.0))               # soft threshold
+            log_one_minus_p = log_one_minus_p + torch.log1p(-p.clamp(max=1 - 1e-6))
+
+        x_hii = 1.0 - torch.exp(log_one_minus_p)           # ionized if ANY scale wins
+        return x_hii.clamp(0.0, 1.0)
+
+    @torch.no_grad()
+    def calibrate_zeta(self, S_emiss, density=None, target=0.5, n_iter=40):
+        """
+        One-time calibration: set zeta so <x_HII> ~ target on the given field.
+        Avoids a saturated start (x~0 or x~1 everywhere) that would stall the
+        global_xHII gradient.  Bisection in log-zeta; no gradient.
+        """
+        lo = torch.tensor(-12.0)   # log zeta
+        hi = torch.tensor(12.0)
+        t  = float(target)
+        for _ in range(n_iter):
+            mid = (lo + hi) / 2
+            self._zeta_raw.data.copy_(_softplus_inverse(mid.exp()))
+            xm = self.forward(S_emiss, density).mean().item()
+            if xm > t:
+                hi = mid
+            else:
+                lo = mid
+        self._zeta_raw.data.copy_(_softplus_inverse(((lo + hi) / 2).exp()))
+
+    def get_params_dict(self) -> dict:
+        return {"zeta": float(self.zeta.item()), "sharpness": float(self.sharpness.item())}
+
+    def extra_repr(self) -> str:
+        return (f"zeta={self.zeta.item():.3f}, sharpness={self.sharpness.item():.2f}, "
+                f"n_scales={len(self.radii_mpc)}")

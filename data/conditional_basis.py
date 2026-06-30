@@ -1,0 +1,452 @@
+"""
+data/conditional_basis.py
+Conditional-ACF unresolved faint-source emissivity basis.
+
+Physical model (replaces the global linear-bias field 1 + b_b*delta)
+--------------------------------------------------------------------
+Instead of painting the unresolved photon budget with a global linear-bias
+field (which carries a uniform DC pedestal and therefore keeps voids bright),
+we build the unresolved faint-source field as a CONDITIONAL stack around the
+observed LAEs -- used ONLY as a spatial prior, with the photon budget fixed
+separately so overlapping profiles do not double-count the faint population.
+
+    1. unnormalised stack (spatial pattern):
+           eps_tilde_b(x) = Sum_i  w_{i,b}^HOD  u_b^s(x - x_i | M_i)
+    2. per-bin UNIT-MEAN normalisation (pure spatial basis):
+           eps_b(x) = eps_tilde_b(x) / <eps_tilde_b>
+    3. impose the HMF/LF/HOD photon budget and learn only the escape fraction:
+           S_unres(x) = Sum_b  f_esc,b  ebar_b  eps_b(x)
+
+where
+    i            runs over observed LAEs at redshift-space positions x_i,
+    b            is a faint-source luminosity / halo-mass bin,
+    w_{i,b}^HOD  = <N_b|M_i>, the expected number of bin-b faint companions of
+                 an LAE of mass M_i (HOD conditional count) -- a RELATIVE weight;
+                 its absolute scale is removed by step 2,
+    u_b^s        is the 3D redshift-space conditional distribution of the faint
+                 excess around an LAE, from the LAE x faint-bin cross-correlation
+                 xi_{LAE,b}(r) broadened along the LOS by RSD / redshift errors /
+                 selection (the 's' = redshift space),
+    ebar_b       = n_bar_b <L_b>, the TOTAL unresolved emissivity of bin b from
+                 HMF/LF/HOD (the photon budget; independent of the LAE stack),
+    f_esc,b      the ONLY learned parameter (escape fraction).
+
+Why the unit-mean step matters
+------------------------------
+Stacking a profile around every observed LAE and summing means a faint source
+near several LAEs is counted several times; without normalisation the global
+budget <eps_tilde_b> grows with the LAE number and with profile overlap.
+Step 2 fixes <eps_b> = 1, so the stack sets only the relative spatial pattern,
+and step 3 sets the absolute budget from HMF/LF/HOD.  Overlap then raises only
+the LOCAL relative density, never the global photon budget.
+
+Only the per-bin escape fraction f_esc,b is learned downstream
+(physics/unresolved_sources.py); this module pre-computes the fixed fields
+basis_b(x) = ebar_b eps_b(x) (so <basis_b> = ebar_b) and returns them in the
+same HODCalibration container used by the linear-bias path, so models.pinn /
+HODUnresolvedField are unchanged.
+
+Why this fixes the x_HII ~0.18 floor
+------------------------------------
+S_unres,b is a sum of localized profiles centred on observed LAEs.  Far from
+any LAE (in voids) it -> 0, so the ionizing field J -> 0 and the equilibrium /
+bubble mapping returns x_HII -> 0 there.  There is no uniform pedestal.
+
+Key implementation insight
+--------------------------
+Sum_i W_i * u(x - x_i)  ==  scatter(LAEs, weights W_i)  convolved-with  u.
+So each (LAE-mass-bin, faint-bin) contribution is one trilinear scatter plus
+one FFT convolution with the (fixed) redshift-space profile kernel.
+
+Decoupling from COF_tools
+-------------------------
+The real-space cross-correlation xi_{LAE,b}(r) is injected as a callable
+`xi_cross(r)`.  In production it is supplied by COF_tools.HOD_FRAMEWORK_CCF
+(see `make_xi_cross_from_cof`).  A power-law fallback
+(`xi_cross_powerlaw`) is provided so the geometry / stacking logic can be
+tested without scipy/astropy/hankel.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+import numpy as np
+
+try:
+    from .preprocessing import HODCalibration, _scatter_count_to_grid
+except ImportError:  # allow standalone import in tests
+    HODCalibration = None
+    _scatter_count_to_grid = None
+
+
+# ------------------------------------------------------------------ #
+#  Real-space cross-correlation suppliers
+# ------------------------------------------------------------------ #
+
+def xi_cross_powerlaw(r0: float = 4.0, gamma: float = 1.8, r_soft: float = 0.5):
+    """
+    Power-law cross-correlation xi(r) = (r/r0)^(-gamma), softened at r<r_soft.
+
+    A lightweight stand-in for the HOD CCF used for testing the stacking
+    geometry without cosmology dependencies.  r0, r in cMpc/h.
+    """
+    def _xi(r):
+        r = np.asarray(r, dtype=np.float64)
+        rr = np.clip(r, r_soft, None)
+        return (rr / r0) ** (-gamma)
+    return _xi
+
+
+def make_xi_cross_from_cof(
+    redshift: float,
+    logM_lae: float,
+    logM_faint: float,
+    cosmo: tuple[float, float, float, float, float] = (0.3089, 0.6911, 0.6774, 0.8159, 0.9667),
+    sigma: float = 0.2,
+    ignore_1h: bool = False,
+):
+    """
+    Build a real-space xi_{LAE,faint}(r) callable from COF_tools.HOD_FRAMEWORK_CCF.
+
+    Each population is modelled as a narrow central-only HOD anchored at its
+    mean halo mass (logMmin = logM_*, satellites switched off via a very large
+    logMsat), so the cross-correlation is set by the two populations' biases
+    plus the 1-halo term.  Plug your ACF-fitted HOD parameters here for the
+    production run.
+
+    Parameters
+    ----------
+    redshift   : snapshot redshift
+    logM_lae   : log10(M_halo/[Msun/h]) of the observed-LAE (mass) bin
+    logM_faint : log10(M_halo/[Msun/h]) of the faint-source bin
+    cosmo      : (Om0, Ov0, h0, sig8, ns)
+    sigma      : log-mass scatter of each HOD central kernel
+    ignore_1h  : drop the 1-halo term (keep only large-scale 2-halo clustering)
+
+    Returns
+    -------
+    xi_cross(r) callable, r in cMpc/h.
+    """
+    # Imported lazily: COF_tools needs scipy/astropy/hankel which are only
+    # required on the production machine, not for the geometry unit tests.
+    import sys, os
+    cof_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "COF_tools")
+    if cof_dir not in sys.path:
+        sys.path.insert(0, cof_dir)
+    from HOD_FRAMEWORK_CCF import HOD_FRAMEWORK_CCF
+
+    Om0, Ov0, h0, sig8, ns = cosmo
+    ccf = HOD_FRAMEWORK_CCF(Om0, Ov0, h0, sig8, ns, redshift)
+
+    logMsat_off = 18.0   # satellites effectively off (Msat >> any halo)
+    logMcut     = 10.0
+    alpha_s     = 1.0
+    ccf.define_model(
+        logM_lae,   sigma, logMsat_off, logMcut, alpha_s,   # population 1 (LAE)
+        logM_faint, sigma, logMsat_off, logMcut, alpha_s,   # population 2 (faint)
+    )
+
+    def _xi(r):
+        r = np.atleast_1d(np.asarray(r, dtype=np.float64))
+        return ccf.galaxy_cross_correlation_function(
+            r,
+            10 ** logM_lae,   sigma, 10 ** logMcut, 10 ** logMsat_off, alpha_s,
+            10 ** logM_faint, sigma, 10 ** logMcut, 10 ** logMsat_off, alpha_s,
+            ignore_1h=ignore_1h,
+        )
+    return _xi
+
+
+# ------------------------------------------------------------------ #
+#  Redshift-space conditional profile kernel u_b^s(r_perp, r_par)
+# ------------------------------------------------------------------ #
+
+def sigma_los_from_dv(dv_max_kms: float, redshift: float, h0: float = 0.6774,
+                      Om0: float = 0.3089, Ov0: float = 0.6911) -> float:
+    """
+    Line-of-sight comoving smoothing length [cMpc/h] from a velocity window.
+
+    sigma_los = dv * (1+z) / H(z) * h ,  H(z) = 100 h E(z) km/s/(Mpc/h).
+    Captures RSD (Fingers-of-God), redshift errors and selection-window
+    broadening along the LOS.  This mirrors the r_los_max used in
+    COF_tools.galaxy_angular_cross_correlation_function.
+    """
+    Ez = np.sqrt(Om0 * (1.0 + redshift) ** 3 + Ov0)
+    Hz = 100.0 * h0 * Ez                      # km/s per (Mpc/h)
+    return float(dv_max_kms * (1.0 + redshift) / Hz * h0)
+
+
+def build_redshift_space_profile(
+    xi_cross,
+    grid_size: int,
+    box_size: float,
+    sigma_los: float,
+    los_axis: int = 2,
+    r_max: float | None = None,
+) -> np.ndarray:
+    """
+    Build the 3D redshift-space conditional excess kernel u^s(r_perp, r_par)
+    on a (G,G,G) grid, centred at (0,0,0) and FFT-ready (zero-lag at origin).
+
+    Steps
+    -----
+    1. real-space excess  w(r) = max(xi_cross(r), 0)   [clustered excess only;
+       no DC pedestal so the field -> 0 far from LAEs]
+    2. RSD: convolve along the LOS axis with a Gaussian of width sigma_los
+       (redshift-space broadening).  This makes the kernel anisotropic:
+       elongated along the line of sight.
+    3. clip >= 0, normalise to unit sum (so a scatter+convolve conserves the
+       deposited companion weight).
+
+    Returns (G,G,G) float64 kernel, rolled so index [0,0,0] is zero-lag.
+    """
+    G = grid_size
+    dx = box_size / G
+
+    coords = (np.arange(G) - G // 2) * dx
+    cx, cy, cz = np.meshgrid(coords, coords, coords, indexing="ij")
+    r = np.sqrt(cx ** 2 + cy ** 2 + cz ** 2)
+    r = np.clip(r, dx / 2, None)
+
+    w = np.asarray(xi_cross(r.ravel()), dtype=np.float64).reshape(r.shape)
+    w = np.clip(w, 0.0, None)
+    if r_max is not None:
+        w[r > r_max] = 0.0
+
+    # RSD: Gaussian smear along the LOS axis (separable 1D convolution)
+    if sigma_los > 0:
+        n_sig = max(1, int(np.ceil(3 * sigma_los / dx)))
+        t = np.arange(-n_sig, n_sig + 1) * dx
+        g = np.exp(-0.5 * (t / sigma_los) ** 2)
+        g /= g.sum()
+        w = _convolve_1d_axis(w, g, axis=los_axis)
+
+    w = np.clip(w, 0.0, None)
+    total = w.sum()
+    if total > 1e-30:
+        w = w / total
+
+    # roll so zero-lag is at [0,0,0] for FFT convolution
+    return np.roll(w, (G // 2, G // 2, G // 2), axis=(0, 1, 2))
+
+
+def _convolve_1d_axis(field: np.ndarray, kern1d: np.ndarray, axis: int) -> np.ndarray:
+    """Convolve a 3D field with a 1D kernel along one axis (reflect padding)."""
+    field = np.moveaxis(field, axis, -1)
+    pad = len(kern1d) // 2
+    fp = np.pad(field, [(0, 0), (0, 0), (pad, pad)], mode="reflect")
+    out = np.zeros_like(field)
+    for j, kj in enumerate(kern1d):
+        out += kj * fp[:, :, j:j + field.shape[-1]]
+    return np.moveaxis(out, -1, axis)
+
+
+# ------------------------------------------------------------------ #
+#  Scatter + convolve helper (pure numpy; mirrors physics/scatter.py)
+# ------------------------------------------------------------------ #
+
+def _scatter_weights_to_grid(pos_norm: np.ndarray, weights: np.ndarray, G: int) -> np.ndarray:
+    """Trilinear scatter of weighted points onto a (G,G,G) grid (numpy)."""
+    grid = np.zeros((G, G, G), dtype=np.float64)
+    pix = np.clip(pos_norm * G, 0, G - 1e-6)
+    i0 = np.floor(pix).astype(int)
+    frac = pix - i0
+    for cx in (0, 1):
+        for cy in (0, 1):
+            for cz in (0, 1):
+                bx = (i0[:, 0] + cx) % G
+                by = (i0[:, 1] + cy) % G
+                bz = (i0[:, 2] + cz) % G
+                wx = frac[:, 0] if cx else 1 - frac[:, 0]
+                wy = frac[:, 1] if cy else 1 - frac[:, 1]
+                wz = frac[:, 2] if cz else 1 - frac[:, 2]
+                np.add.at(grid, (bx, by, bz), weights * wx * wy * wz)
+    return grid
+
+
+def _fft_convolve(S: np.ndarray, K: np.ndarray) -> np.ndarray:
+    """Periodic FFT convolution; K already rolled to zero-lag at origin."""
+    return np.fft.irfftn(np.fft.rfftn(S) * np.fft.rfftn(K), s=S.shape)
+
+
+# ------------------------------------------------------------------ #
+#  Main builder
+# ------------------------------------------------------------------ #
+
+def build_conditional_unresolved_basis(
+    snap,                                   # SimSnapshot of OBSERVED LAEs (graph nodes)
+    muv_bin_edges: list[float],             # faint-source M_UV bin edges
+    grid_size: int = 64,
+    n_lae_mass_bins: int = 4,               # split LAEs by halo mass
+    dv_max_kms: float = 1000.0,             # LOS redshift-space window
+    los_axis: int = 2,
+    r_max: float | None = 40.0,             # truncate profile [cMpc/h]
+    use_cof: bool = True,                   # COF HOD CCF vs power-law fallback
+    cosmo: tuple = (0.3089, 0.6911, 0.6774, 0.8159, 0.9667),
+    snap_full=None,                         # full catalog for faint <L_b>, n_bar
+    muv_det: float | None = None,
+):
+    """
+    Build the conditional-ACF unresolved emissivity basis S_unres,b(x).
+
+    Returns an object exposing `.basis_fields` (n_bins, G, G, G), `.bin_labels`,
+    `.hod_params`, `.source` -- API-compatible with preprocessing.HODCalibration
+    so it is a drop-in for the linear-bias basis.
+
+    Notes
+    -----
+    * Observed LAEs come from `snap` (the same catalog used to build the graph).
+    * Faint-source mean luminosity <L_b> and number density n_bar_b are measured
+      from `snap_full` (the full catalog incl. faint halos); falls back to `snap`.
+    * <N_b|M_m> (expected excess companions) = n_bar_b * integral of the excess
+      profile over the box, evaluated per (LAE-mass-bin m, faint-bin b).
+    """
+    G = grid_size
+    box = snap.box_size
+    z = float(snap.redshift)
+    Om0, Ov0, h0, sig8, ns = cosmo
+    full = snap_full if snap_full is not None else snap
+    if muv_det is None:
+        muv_det = float(np.max(snap.muv))   # faint = fainter than detected LAEs
+
+    sigma_los = sigma_los_from_dv(dv_max_kms, z, h0, Om0, Ov0)
+    dV = (box / G) ** 3
+
+    # ---- LAE mass bins (population 1) ----
+    lae_logM = np.log10(np.clip(snap.halo_mass, 1e6, None))
+    edges = np.quantile(lae_logM, np.linspace(0, 1, n_lae_mass_bins + 1))
+    edges[0] -= 1e-6; edges[-1] += 1e-6
+    lae_pos_norm = (snap.pos / box).astype(np.float64)
+    lae_mass_bin = np.clip(np.digitize(lae_logM, edges) - 1, 0, n_lae_mass_bins - 1)
+    lae_logM_mean = np.array([
+        lae_logM[lae_mass_bin == m].mean() if np.any(lae_mass_bin == m) else lae_logM.mean()
+        for m in range(n_lae_mass_bins)
+    ])
+
+    # ---- faint-source bins (population 2): mean luminosity, n_bar, mean mass ----
+    n_bins = len(muv_bin_edges)            # last bin open-ended
+    faint_mask = full.muv > muv_det
+    f_muv = full.muv[faint_mask]
+    f_lya = full.lya_obs[faint_mask]
+    f_logM = np.log10(np.clip(full.halo_mass[faint_mask], 1e6, None))
+    box_vol = box ** 3
+
+    bin_labels, Lbar_b, nbar_b, faint_logM = [], [], [], []
+    for b in range(n_bins):
+        lo = muv_bin_edges[b]
+        hi = muv_bin_edges[b + 1] if b + 1 < n_bins else np.inf
+        if np.isinf(hi):
+            m_b = f_muv > lo;  label = f"MUV>{lo:.1f}"
+        else:
+            m_b = (f_muv > lo) & (f_muv <= hi);  label = f"MUV({lo:.1f},{hi:.1f}]"
+        bin_labels.append(label)
+        N_b = int(m_b.sum())
+        Lbar_b.append(float(np.mean(np.clip(f_lya[m_b], 0, None))) if N_b > 0 else 0.0)
+        nbar_b.append(N_b / box_vol)
+        faint_logM.append(float(f_logM[m_b].mean()) if N_b > 0 else 8.0)
+
+    # Relative mean luminosity per bin.  Absolute L (~1e41 erg/s) overflows
+    # float32 and its overall scale is absorbed downstream by f_esc and the
+    # model's amplitude calibration; only the RELATIVE amplitude across bins is
+    # physical here, so normalise by the brightest bin.
+    L_ref = max(Lbar_b) if max(Lbar_b) > 0 else 1.0
+    Lbar_rel = [L / L_ref for L in Lbar_b]
+
+    # Absolute (relative-across-bins) unresolved EMISSIVITY budget per bin, set
+    # by HMF/LF/HOD:  ebar_b = n_bar_b * <L_b>.  This is the photon budget; the
+    # LAE stack only supplies the spatial PATTERN.  Keeping it separate is what
+    # prevents profile overlap / LAE count from inflating the global budget.
+    ebar_b = [nbar_b[b] * Lbar_rel[b] for b in range(n_bins)]
+
+    # ---- assemble per bin: spatial prior (unit-mean) x photon budget ----
+    #   eps_tilde_b(x) = Sum_i w_{i,b}^HOD u_b^s(x - x_i)     (unnormalised stack)
+    #   eps_b(x)       = eps_tilde_b / <eps_tilde_b>          (UNIT-MEAN basis)
+    #   basis_b(x)     = ebar_b * eps_b(x)   =>   <basis_b> = ebar_b
+    # so S_unres = Sum_b f_esc,b * basis_b has a budget fixed by HMF/LF/HOD,
+    # independent of how many LAEs there are or how much the profiles overlap.
+    basis = np.zeros((n_bins, G, G, G), dtype=np.float64)
+    Ncomp = np.zeros((n_lae_mass_bins, n_bins))
+    for b in range(n_bins):
+        if ebar_b[b] <= 0:
+            continue
+        eps_tilde = np.zeros((G, G, G), dtype=np.float64)
+        for m in range(n_lae_mass_bins):
+            sel = (lae_mass_bin == m)
+            if not np.any(sel):
+                continue
+            if use_cof:
+                xi = make_xi_cross_from_cof(z, lae_logM_mean[m], faint_logM[b], cosmo)
+            else:
+                # power-law amplitude scaled by the geometric mean bias proxy
+                r0 = 3.0 * (10 ** ((lae_logM_mean[m] + faint_logM[b]) / 2 - 10)) ** 0.05
+                xi = xi_cross_powerlaw(r0=max(r0, 1.0), gamma=1.8)
+
+            u = build_redshift_space_profile(xi, G, box, sigma_los, los_axis, r_max)
+
+            # expected excess companion count <N_b|M_m> = n_bar_b * integral(excess)
+            xi_excess_integral = float(np.clip(
+                np.asarray(xi(_radial_grid(G, box).ravel())), 0, None).sum()) * dV
+            Ncomp[m, b] = nbar_b[b] * xi_excess_integral
+
+            # HOD stacking weight per LAE = expected companion count <N_b|M_m>.
+            # Its ABSOLUTE scale is normalised away below (unit mean), so profile
+            # overlap / LAE count cannot inflate the budget; only the RELATIVE
+            # weighting across LAE mass bins (massive LAEs attract more faint
+            # companions) survives in the spatial pattern.
+            w_hod = Ncomp[m, b]
+            if w_hod <= 0:
+                continue
+            S_pts = _scatter_weights_to_grid(lae_pos_norm[sel], np.full(int(sel.sum()), w_hod), G)
+            eps_tilde += _fft_convolve(S_pts, u)
+
+        eps_tilde = np.clip(eps_tilde, 0.0, None)
+        mean_tilde = float(eps_tilde.mean())
+        if mean_tilde <= 1e-30:
+            continue                                  # no spatial info; leave bin empty
+        eps_b = eps_tilde / mean_tilde                # unit-mean spatial basis
+        basis[b] = ebar_b[b] * eps_b                  # impose HMF/LF/HOD budget
+
+    hod_params = {
+        "bias":         [0.0] * n_bins,            # not used by this path
+        "n_bar":        nbar_b,
+        "mean_log_lum": [np.log10(L + 1e-30) for L in Lbar_b],
+        "N_halos":      [int((f_muv > (muv_bin_edges[b])).sum()) for b in range(n_bins)],
+        "N_companions": Ncomp.tolist(),
+        "lae_logM_bins": lae_logM_mean.tolist(),
+        # emissivity budget per bin (n_bar*<L>, relative across bins). After
+        # unit-mean normalisation of the spatial basis, <basis_b> = ebar_b.
+        "ebar_emissivity": ebar_b,
+    }
+
+    cal = _make_calibration(
+        basis_fields=basis.astype(np.float32),
+        bin_labels=bin_labels,
+        hod_params=hod_params,
+        source="conditional_acf",
+    )
+    return cal
+
+
+def _radial_grid(G: int, box: float) -> np.ndarray:
+    dx = box / G
+    coords = (np.arange(G) - G // 2) * dx
+    cx, cy, cz = np.meshgrid(coords, coords, coords, indexing="ij")
+    r = np.sqrt(cx ** 2 + cy ** 2 + cz ** 2)
+    return np.clip(r, dx / 2, None)
+
+
+class _CalibrationStandIn:
+    """Duck-typed HODCalibration used when preprocessing (torch) is unavailable."""
+    def __init__(self, basis_fields, bin_labels, hod_params, source):
+        self.basis_fields = basis_fields
+        self.bin_labels   = bin_labels
+        self.hod_params   = hod_params
+        self.source       = source
+
+
+def _make_calibration(basis_fields, bin_labels, hod_params, source):
+    """Return a HODCalibration (if importable) else a duck-typed stand-in."""
+    if HODCalibration is not None:
+        return HODCalibration(basis_fields=basis_fields, bin_labels=bin_labels,
+                              hod_params=hod_params, source=source)
+    return _CalibrationStandIn(basis_fields, bin_labels, hod_params, source)
