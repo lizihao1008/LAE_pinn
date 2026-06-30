@@ -560,3 +560,49 @@ def prepare_snapshot(
         "box_size":        snap.box_size,
         "grid_size":       grid_size,
     }
+
+
+def prepare_patch(
+    patch,                               # PatchSnapshot (or any duck-typed catalog + xgrid)
+    stats: dict[str, tuple[float, float]],
+    grid_size: int | None = None,
+    muv_det: float = -17.5,
+    muv_bin_edges: list[float] | None = None,
+    hod_calibration: HODCalibration | None = None,
+    device: str | torch.device = "cpu",
+) -> dict:
+    """
+    Like prepare_snapshot(), but the ionization field is taken directly from
+    patch.xgrid (already cropped to the patch volume by make_train_data.py).
+    """
+    G = grid_size if grid_size is not None else int(patch.xgrid.shape[0])
+    xbox = patch.xgrid
+    if xbox.shape != (G, G, G):
+        if xbox.shape[0] % G == 0:
+            xbox = downsample_grid(xbox, target=G)
+        else:
+            raise ValueError(f"patch xgrid {xbox.shape} incompatible with grid_size={G}")
+
+    if hod_calibration is None:
+        hod_calibration = build_hod_basis_from_simulation(
+            patch,
+            muv_det=muv_det,
+            muv_bin_edges=muv_bin_edges,
+            grid_size=G,
+        )
+
+    hod_basis_t = torch.from_numpy(hod_calibration.basis_fields).to(device)
+
+    return {
+        "pos":             torch.from_numpy((patch.pos / patch.box_size).astype(np.float32)).to(device),
+        "pos_raw":         torch.from_numpy(patch.pos.astype(np.float32)).to(device),
+        "node_feats":      build_node_features(patch, stats, device),
+        "src_weights":     build_source_weights(patch, device),
+        "xbox_true":       grid_to_tensor(xbox, device),
+        "hod_basis":       hod_basis_t,
+        "hod_calibration": hod_calibration,
+        "xi_global":       patch.xi_global,
+        "z":               patch.redshift,
+        "box_size":        patch.box_size,
+        "grid_size":       G,
+    }

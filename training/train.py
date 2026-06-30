@@ -85,7 +85,12 @@ def train(
             for pg in optimizer.param_groups:
                 pg["lr"] = lr * epoch / warmup
 
-        for graph in graph_list:
+        graphs_this_epoch = list(graph_list)
+        if len(graphs_this_epoch) > 1:
+            import random
+            random.shuffle(graphs_this_epoch)
+
+        for graph in graphs_this_epoch:
             graph = graph.to(device)
             optimizer.zero_grad()
 
@@ -117,10 +122,10 @@ def train(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            epoch_losses["total"] += total.item() / len(graph_list)
+            epoch_losses["total"] += total.item() / len(graphs_this_epoch)
             for k, v in components.items():
                 if k in epoch_losses:
-                    epoch_losses[k] += v / len(graph_list)
+                    epoch_losses[k] += v / len(graphs_this_epoch)
 
         if epoch > warmup:
             scheduler.step()
