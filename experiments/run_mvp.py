@@ -59,8 +59,11 @@ def parse_args():
                    help="LOS redshift-space window [km/s] for conditional profiles")
     p.add_argument("--n_lae_mass_bins", type=int, default=4,
                    help="number of LAE halo-mass bins for the conditional stack")
-    p.add_argument("--no_cof", action="store_true",
-                   help="use power-law xi(r) fallback instead of COF_tools HOD CCF")
+    p.add_argument("--profile_source", choices=["observed_acf", "cof", "powerlaw"],
+                   default="observed_acf",
+                   help="conditional spatial template: observed_acf = measured from the "
+                        "MUV-cut LAE auto-correlation (observable, no oracle, no HOD fit); "
+                        "cof = COF_tools halo-model CCF (observation transfer); powerlaw = test")
     return p.parse_args()
 
 
@@ -127,15 +130,14 @@ def main():
     if args.unresolved == "conditional":
         from data.conditional_basis import build_conditional_unresolved_basis
         print(f"  Unresolved model: conditional ACF stack "
-              f"(dv_max={args.dv_max:.0f} km/s, "
-              f"{'power-law xi' if args.no_cof else 'COF HOD CCF'})")
+              f"(profile={args.profile_source}, dv_max={args.dv_max:.0f} km/s)")
         hod_calibration = build_conditional_unresolved_basis(
             snap,                                  # observed LAEs (graph nodes)
             muv_bin_edges   = muv_bin_edges,
             grid_size       = args.grid,
             n_lae_mass_bins = args.n_lae_mass_bins,
             dv_max_kms      = args.dv_max,
-            use_cof         = not args.no_cof,
+            profile_source  = args.profile_source,
             snap_full       = snap_full,
             muv_det         = args.muv_cut,
         )
