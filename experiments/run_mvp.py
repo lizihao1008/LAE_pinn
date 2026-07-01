@@ -89,6 +89,9 @@ def parse_args():
                    help="conditional spatial template: observed_acf = measured from the "
                         "MUV-cut LAE auto-correlation (observable, no oracle, no HOD fit); "
                         "cof = COF_tools halo-model CCF (observation transfer); powerlaw = test")
+    p.add_argument("--los_transmission", type=float, default=argparse.SUPPRESS,
+                   help="LOS Lyα transmission loss weight (overrides "
+                        "training.loss_weights.los_transmission in yaml; 0 disables)")
     cli = p.parse_args()
 
     if cli.config is not None:
@@ -121,6 +124,7 @@ def parse_args():
         profile_source="observed_acf",
         muv_faint_limit=-15.0,
         muv_bin_step=0.5,
+        los_transmission=0.0,
         seed=None,
         _yaml_cfg=None,
     )
@@ -255,14 +259,23 @@ def main(args=None):
     print(f"  alpha_nH_scale_init = {alpha_init:.2f}  (xi_global={xi_val:.3f} → A_target={A_target:.3f})")
 
     yaml_cfg = getattr(args, "_yaml_cfg", None)
+    cfg_for_model = None
     if yaml_cfg is not None:
         from config.load_config import sync_mvp_args_into_config
         cfg_for_model = sync_mvp_args_into_config(yaml_cfg, args)
         cfg_for_model.setdefault("data", {})["box_size_mpc"] = snap.box_size
         cfg_for_model.setdefault("unresolved_sources", {})["n_hod_bins"] = n_hod_bins
         cfg_for_model.setdefault("excursion_set", {})["alpha_nH_scale_init"] = alpha_init
+        lt = dict(cfg_for_model.get("los_transmission", {}) or {})
+        lt["redshift"] = args.redshift
+        cfg_for_model["los_transmission"] = lt
         model = build_pinn_from_config(cfg_for_model)
     else:
+        los_w = float(getattr(args, "los_transmission", 0.0))
+        los_cfg = (
+            {"enabled": True, "target": "tigm", "redshift": args.redshift}
+            if los_w > 0 else None
+        )
         model = LAEPINN(
             gnn_in_channels=8,
             gnn_hidden_dim=64,
@@ -279,19 +292,24 @@ def main(args=None):
             excursion_type=args.excursion,
             alpha_nH_scale_init=alpha_init,
             field_generator=args.field_generator,
+            los_transmission=los_cfg,
         )
     print(f"  Ionization core: {args.excursion}")
     print(f"  Field generator: {model.field_generator}"
           + ("  (mesh-free off-grid queries; grid training uses scatter+FFT)"
              if model.field_generator == "continuous" else ""))
+    los_w = float(getattr(args, "los_transmission", 0.0))
+    if getattr(model, "los_enabled", False) or los_w > 0:
+        print(f"  LOS transmission loss weight: {los_w}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Trainable parameters: {n_params:,}")
 
     # ---- 5. Train ----
     if yaml_cfg is not None:
         from config.load_config import training_cfg_from_yaml
-        cfg = training_cfg_from_yaml(yaml_cfg, n_epochs=args.epochs)
+        cfg = training_cfg_from_yaml(cfg_for_model, n_epochs=args.epochs)
     else:
+        los_w = float(getattr(args, "los_transmission", 0.0))
         cfg = {
             "training": {
                 "n_epochs": args.epochs,
@@ -304,9 +322,11 @@ def main(args=None):
                     "binary_bce":     0.5,
                     "global_xHII":   10.0,
                     "prior":          0.1,
+                    "los_transmission": los_w,
                 },
             },
             "experiment": {"log_every": max(1, args.epochs // 10)},
+            "los_transmission": {"target": "tigm"},
         }
     print(f"\nTraining for {args.epochs} epochs...\n")
     history = train(model, [graph], cfg, save_dir=args.save_dir,

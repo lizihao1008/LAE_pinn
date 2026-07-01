@@ -78,6 +78,7 @@ def mvp_settings_from_config(cfg: dict) -> argparse.Namespace:
         profile_source=unr.get("profile_source", "observed_acf"),
         muv_faint_limit=float(unr.get("muv_faint_limit", -15.0)),
         muv_bin_step=float(unr.get("muv_bin_step", 0.5)),
+        los_transmission=float(train.get("loss_weights", {}).get("los_transmission", 0.0)),
         seed=int(exp.get("seed", 42)),
         _yaml_cfg=cfg,
     )
@@ -133,6 +134,17 @@ def sync_mvp_args_into_config(cfg: dict, args: argparse.Namespace) -> dict:
     data["grid_mvp"] = args.grid
     data["muv_cut"] = args.muv_cut
     out["data"] = data
+
+    train = dict(out.get("training", {}))
+    lw = dict(train.get("loss_weights", {}))
+    lw["los_transmission"] = float(args.los_transmission)
+    train["loss_weights"] = lw
+    out["training"] = train
+
+    lt = dict(out.get("los_transmission", {}) or {})
+    if float(args.los_transmission) <= 0:
+        lt["enabled"] = False
+    out["los_transmission"] = lt
     return out
 
 
