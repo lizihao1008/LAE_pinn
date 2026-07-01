@@ -32,6 +32,7 @@ try:
     from ..physics.continuous_field import (
         render_obs_field_on_grid, render_bubble_on_grid, calibrate_bubble_zeta,
     )
+    from ..physics.los_transmission import LOSTransmission
 except ImportError:  # python -m experiments.run_mvp with project root on sys.path
     from physics.kernels import MixtureKernel, build_kernel, make_3d_kernel_grid
     from physics.scatter import scatter_to_grid, fft_convolve_3d
@@ -42,6 +43,7 @@ except ImportError:  # python -m experiments.run_mvp with project root on sys.pa
     from physics.continuous_field import (
         render_obs_field_on_grid, render_bubble_on_grid, calibrate_bubble_zeta,
     )
+    from physics.los_transmission import LOSTransmission
 from .gnn_encoder import build_gnn_encoder
 from .source_head import SourceHead
 
@@ -115,6 +117,9 @@ class LAEPINN(nn.Module):
         # importable; a runtime self-check falls back to dense on any mismatch.
         continuous_neighbor_list="auto",
         continuous_neighbor_max: int = 8192,
+        # LOS Lyα transmission (auxiliary): dict from config["los_transmission"].
+        # Lyα marks constrain LOS transmission, NOT the local x_HII label.
+        los_transmission: dict | None = None,
     ):
         super().__init__()
 
@@ -245,6 +250,33 @@ class LAEPINN(nn.Module):
             self.excursion = ExcursionSetMapping(
                 alpha_nH_scale_init=alpha_nH_scale_init,
                 learnable=excursion_learnable,
+            )
+
+        # --- LOS Lyα transmission module (auxiliary) ---
+        # Casts a ray along the observer axis through the PREDICTED field and
+        # integrates a damping-wing optical depth -> T_IGM_hat per LAE.  Lyα marks
+        # are compared to T_IGM_hat (LOS effect), not to the local x_HII voxel.
+        lt = los_transmission or {}
+        self.los_enabled = bool(lt.get("enabled", False))
+        self.los_target = lt.get("target", "tigm")
+        if self.los_enabled:
+            self.los = LOSTransmission(
+                box_size=box_size,
+                los_axis=lt.get("los_axis", los_axis),   # default: observer/RSD axis
+                los_sign=lt.get("los_sign", 1),
+                r_max_mpc=lt.get("r_max_mpc", 80.0),
+                n_steps=lt.get("n_steps", 64),
+                redshift=lt.get("redshift", 7.0),
+                omega_m=lt.get("omega_m", 0.3089),
+                hubble_kms_per_cmpc=lt.get("hubble_kms_per_cmpc", None),
+                v_floor=lt.get("v_floor", 50.0),
+                v_ref=lt.get("v_ref", 600.0),
+                dv_lya_init=lt.get("dv_lya_init", 200.0),
+                tau_cgm_init=lt.get("tau_cgm_init", 0.05),
+                amp_init=lt.get("amp_init", 1.0),
+                learn_dv=lt.get("learn_dv", True),
+                learn_tau_cgm=lt.get("learn_tau_cgm", True),
+                learn_amp=lt.get("learn_amp", True),
             )
 
     def forward(
@@ -506,6 +538,17 @@ class LAEPINN(nn.Module):
         out["S_obs_scale"] = float(S_obs_scale.item())    # raw S_obs mean (per-batch)
         out["A_obs"]       = float(A_obs.detach().item())  # current S_obs amplitude factor
 
+        # --- LOS Lyα transmission (auxiliary): ray-traced T_IGM per LAE ---
+        # Sampled from the PREDICTED field along the observer axis; grad flows to
+        # the field (via x_HI along the ray) and to (dv_Lya, tau_CGM, amp).
+        if self.los_enabled:
+            los_out = self.los(
+                x_hii_pred, pos_scatter,
+                z=float(getattr(graph, "z", self.los._default_z)),
+            )
+            out["T_IGM_hat"] = los_out["T_IGM_hat"]   # (N,) predicted transmission
+            out["tau_los"]   = los_out["tau_los"]     # (N,) effective optical depth
+
         if return_intermediates:
             out.update({
                 "S_obs":       S_obs,       # scatter grid of LAEs  (pre-kernel)
@@ -536,6 +579,9 @@ class LAEPINN(nn.Module):
             params["alpha_nH_scale"] = float(self.excursion.alpha_nH_scale.item())
         # log_A_obs: learnable log-deviation from equi-amplitude for S_obs vs S_unres
         params["log_A_obs"] = float(self._log_A_obs.item())
+        # LOS transmission parameters (dv_Lya, tau_CGM, amp)
+        if getattr(self, "los_enabled", False):
+            params.update(self.los.get_params_dict())
         return params
 
     def continuous_field(self, graph: Data, hod_basis: torch.Tensor,
@@ -574,6 +620,10 @@ def build_pinn_from_config(cfg: dict) -> LAEPINN:
     rsd_cfg = cfg.get("rsd_correction", {})
     cf_cfg  = cfg.get("continuous_field", {})
     field_generator = cf_cfg.get("generator", cfg.get("field_generator", "continuous"))
+    # LOS transmission: default its observer axis to the RSD/observer axis.
+    lt_cfg = dict(cfg.get("los_transmission", {}) or {})
+    if lt_cfg and lt_cfg.get("los_axis") is None:
+        lt_cfg["los_axis"] = rsd_cfg.get("los_axis", 2)
     return LAEPINN(
         gnn_architecture=gnn_cfg.get("architecture", "GATv2Conv"),
         gnn_in_channels=len(cfg.get("graph", {}).get("node_features", range(8))),
@@ -610,4 +660,5 @@ def build_pinn_from_config(cfg: dict) -> LAEPINN:
         continuous_checkpoint=cf_cfg.get("checkpoint", True),
         continuous_neighbor_list=cf_cfg.get("neighbor_list", "auto"),
         continuous_neighbor_max=cf_cfg.get("neighbor_max", 8192),
+        los_transmission=lt_cfg,
     )

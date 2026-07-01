@@ -116,12 +116,17 @@ def build_graph_from_snapshot(
     device     = node_feats.device
     N          = len(pos_raw)
 
+    # Raw per-LAE Lyα marks (observation targets for the LOS transmission loss).
+    mark_keys = ("tigm_obs", "lya_int", "lya_obs", "muv")
+    marks = {k: snap_dict.get(k) for k in mark_keys}
+
     # ── Subsample all per-node arrays with the same index ──────────
     if subsample is not None and N > subsample:
         idx         = np.random.choice(N, subsample, replace=False)
         pos_raw     = pos_raw[idx]
         node_feats  = node_feats[idx]
         src_weights = src_weights[idx]
+        marks       = {k: (v[idx] if v is not None else None) for k, v in marks.items()}
 
     graph = build_knn_graph(
         pos=pos_raw,
@@ -142,5 +147,10 @@ def build_graph_from_snapshot(
     graph.z             = snap_dict["z"]
     graph.box_size      = snap_dict["box_size"]
     graph.grid_size     = snap_dict["grid_size"]
+
+    # Raw Lyα marks (LOS transmission targets); attached only if present.
+    for k, v in marks.items():
+        if v is not None:
+            setattr(graph, k, v.to(device))
 
     return graph

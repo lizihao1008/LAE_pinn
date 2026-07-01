@@ -49,6 +49,7 @@ def train(
     log_every  = cfg.get("experiment", {}).get("log_every", 10)
 
     w = train_cfg.get("loss_weights", {})
+    los_target = cfg.get("los_transmission", {}).get("target", "tigm")
     loss_fn = PINNLoss(
         field_mse_w=w.get("field_mse", 1.0),
         power_spec_w=w.get("power_spectrum", 0.1),
@@ -56,12 +57,14 @@ def train(
         mcf_w=w.get("mcf_consistency", 0.0),
         global_xhii_w=w.get("global_xHII", 1.0),
         prior_w=w.get("prior", 0.1),
+        los_transmission_w=w.get("los_transmission", 0.0),
+        los_target=los_target,
     )
 
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=wd)
     scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=lr * 0.01)
 
-    history = {"total": [], "field": [], "ps": [], "bce": [], "xhii": [], "prior": []}
+    history = {"total": [], "field": [], "ps": [], "bce": [], "xhii": [], "prior": [], "los": []}
 
     # Print HOD calibration once (it's fixed throughout training)
     if verbose:
@@ -106,7 +109,7 @@ def train(
             x_true = graph.xbox_true.squeeze()  # (G, G, G)
 
             total, components = loss_fn(
-                out, x_true, graph.xi_global, model.unresolved
+                out, x_true, graph.xi_global, model.unresolved, graph=graph
             )
 
             # Guard: skip gradient step if loss is NaN/Inf (can happen in
@@ -169,11 +172,18 @@ def train(
                 fesc_str = (f"fesc min={fmin:.3f} mean={fmean:.3f} max={fmax:.3f} "
                             f"[{' '.join(f'{v:.2f}' for v in fesc_vals)}]")
 
+            los_str = ""
+            if getattr(model, "los_enabled", False):
+                los_str = (f"los={epoch_losses['los']:.4f} "
+                           f"dvLya={phys.get('dv_lya_kms', 0):.0f} "
+                           f"τCGM={phys.get('tau_cgm', 0):.3f} | ")
+
             print(
                 f"Epoch {epoch:4d}/{n_epochs} | "
                 f"Loss={epoch_losses['total']:.4f} | "
                 f"field={epoch_losses['field']:.4f} | "
                 f"xHII={epoch_losses['xhii']:.4f} | "
+                f"{los_str}"
                 f"<x>={x_pred_mean:.3f}±{x_pred_std:.3f} ξ={xi_last:.3f} | "
                 f"Jσ={j_norm_std:.3f} Sobs={s_obs_scale:.2e} A_obs={a_obs_val:.1f} | "
                 f"α={phys.get('alpha_nH_scale', 0):.3f} "

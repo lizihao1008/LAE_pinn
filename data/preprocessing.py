@@ -547,6 +547,9 @@ def prepare_snapshot(
     xbox_ds    = downsample_grid(snap.xbox_512, target=grid_size)
     hod_basis_t = torch.from_numpy(hod_calibration.basis_fields).to(device)
 
+    def _f32(a):
+        return torch.from_numpy(np.asarray(a, dtype=np.float32)).to(device)
+
     return {
         "pos":             torch.from_numpy((snap.pos / snap.box_size).astype(np.float32)).to(device),
         "pos_raw":         torch.from_numpy(snap.pos.astype(np.float32)).to(device),
@@ -559,6 +562,12 @@ def prepare_snapshot(
         "z":               snap.redshift,
         "box_size":        snap.box_size,
         "grid_size":       grid_size,
+        # ── Raw per-LAE Lyα marks (NOT normalised) for the LOS transmission loss.
+        #    These are OBSERVATION targets, not GNN inputs: tigm = L_obs / L_int.
+        "tigm_obs":        _f32(snap.tigm),        # (N,) LOS transmission in [0,1]
+        "lya_int":         _f32(snap.lya_int),     # (N,) intrinsic Lyα luminosity
+        "lya_obs":         _f32(snap.lya_obs),     # (N,) observed Lyα luminosity
+        "muv":             _f32(snap.muv),         # (N,) UV magnitude
     }
 
 

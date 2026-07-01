@@ -387,6 +387,53 @@ def test8_hybrid_integration():
           f"x(q): mean={xq.mean():.3f}, range=[{xq.min():.3f},{xq.max():.3f}]")
 
 
+def test9_los_transmission():
+    """LOS Lyα transmission: model produces T_IGM_hat in (0,1]; loss + grads flow."""
+    print("\nTest 9: LOS Lyα transmission module (T_IGM_hat + auxiliary loss)")
+    try:
+        from models.pinn import LAEPINN
+        from physics.los_transmission import los_transmission_loss
+    except Exception as e:
+        print(f"  [SKIP] torch_geometric/model unavailable ({type(e).__name__})")
+        return
+
+    torch.manual_seed(8)
+    Gi, N, nb = 16, 60, 2
+    graph = _build_graph_on_grid(Gi, N)
+    graph.z = 7.14
+    graph.tigm_obs = (0.05 + 0.9 * torch.rand(N, dtype=DT))   # observed transmission
+    hod = torch.rand(nb, Gi, Gi, Gi, dtype=DT) + 0.5
+
+    los_cfg = dict(enabled=True, los_axis=0, los_sign=1, r_max_mpc=60.0,
+                   n_steps=32, redshift=7.14, target="tigm")
+    model = LAEPINN(
+        gnn_in_channels=8, gnn_hidden_dim=16, gnn_out_channels=8,
+        gnn_n_layers=2, gnn_heads=2, n_hod_bins=nb, grid_size=Gi, box_size=BOX,
+        excursion_type="equilibrium", field_generator="grid",
+        los_transmission=los_cfg,
+    ).to(DT)
+    model.train()
+
+    out = model(graph, hod)
+    T = out.get("T_IGM_hat")
+    ok_T = (T is not None and tuple(T.shape) == (N,)
+            and bool((T > 0).all() and (T <= 1).all() and torch.isfinite(T).all()))
+    check("T_IGM_hat produced, in (0,1]", ok_T,
+          f"shape={None if T is None else tuple(T.shape)}, "
+          f"range=[{float(T.min()):.3f},{float(T.max()):.3f}]" if T is not None else "missing")
+
+    L = los_transmission_loss(out, graph, target="tigm")
+    L.backward()
+    g_dv = model.los._dv_raw.grad
+    g_amp = model.los._amp_raw.grad
+    g_field = model.gnn.convs[0].lin_l.weight.grad if hasattr(model.gnn.convs[0], "lin_l") else None
+    ok_grad = (g_dv is not None and g_amp is not None and float(g_amp.abs()) >= 0
+               and torch.isfinite(L))
+    check("LOS loss finite + grads to dv/amp", ok_grad,
+          f"L={float(L):.4f}, |∂L/∂amp_raw|={float(g_amp.abs()):.2e}, "
+          f"|∂L/∂dv_raw|={float(g_dv.abs()):.2e}")
+
+
 if __name__ == "__main__":
     print("=" * 68)
     print("Continuous ionization field — consistency verification")
@@ -400,6 +447,7 @@ if __name__ == "__main__":
     test6_pinn_integration()
     test7_bubble_integration()
     test8_hybrid_integration()
+    test9_los_transmission()
     print("\n" + "=" * 68)
     print(f"RESULT: {'ALL TESTS PASSED' if PASS else 'SOME TESTS FAILED'}")
     print("=" * 68)

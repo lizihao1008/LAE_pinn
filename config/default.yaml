@@ -129,6 +129,29 @@ excursion_set:
   # bubbles, so the hybrid starts ~ the pure bubble and refines the interior.
   hybrid_residual_scale_init: 0.1
 
+# ── LOS Lyα transmission (auxiliary) ────────────────────────────────────────
+# Lyα visibility is a LINE-OF-SIGHT effect, not a local x_HII label. This module
+# ray-traces the predicted field along the observer axis from each LAE and
+# integrates a damping-wing optical depth -> T_IGM_hat, compared to the observed
+# transmission (tigm = L_obs/L_int) via loss_weights.los_transmission.
+los_transmission:
+  enabled: true
+  target: tigm            # "tigm" (MSE log T_hat vs log tigm) | "lya" (via L_int)
+  los_axis: null          # null → defaults to rsd_correction.los_axis (observer axis)
+  los_sign: 1             # +1 or -1 direction toward the observer along the axis
+  r_max_mpc: 80.0         # ray length (cMpc/h)
+  n_steps: 64             # ray samples (midpoint rule)
+  omega_m: 0.3089         # for H(z); h cancels in km/s per cMpc/h
+  hubble_kms_per_cmpc: null   # null → computed from snapshot z and omega_m
+  v_floor: 50.0           # km/s floor in the detuning kernel (stability)
+  v_ref: 600.0            # km/s reference: non-dimensionalises W so amp~O(1)→tau~O(1)
+  dv_lya_init: 200.0      # intrinsic Lyα velocity offset [km/s] (population)
+  tau_cgm_init: 0.05      # local CGM attenuation
+  amp_init: 1.0           # optical-depth normalisation
+  learn_dv: true
+  learn_tau_cgm: true
+  learn_amp: true
+
 training:
   batch_size: 1                       # 1 snapshot per step (full-field)
   n_epochs: 200
@@ -143,6 +166,7 @@ training:
     mcf_consistency: 0.05
     global_xHII: 1.0
     prior: 0.1
+    los_transmission: 0.5   # auxiliary LOS Lyα-transmission constraint (0 disables)
 
 evaluation:
   mcf_r_bins: [2, 4, 6, 8, 10, 15, 20, 30]   # cMpc/h

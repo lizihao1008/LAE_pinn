@@ -152,4 +152,8 @@ def training_cfg_from_yaml(cfg: dict, n_epochs: int | None = None) -> dict:
         "experiment": {
             "log_every": int(exp.get("log_every", max(1, epochs // 10))),
         },
+        # LOS transmission target (tigm|lya) for the auxiliary loss in train.py.
+        "los_transmission": {
+            "target": cfg.get("los_transmission", {}).get("target", "tigm"),
+        },
     }

@@ -18,6 +18,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+try:
+    from ..physics.los_transmission import los_transmission_loss
+except ImportError:
+    from physics.los_transmission import los_transmission_loss
+
 
 # ------------------------------------------------------------------ #
 #  Individual loss terms
@@ -141,6 +146,8 @@ class PINNLoss(torch.nn.Module):
         prior_w:        float = 0.1,
         lf_weight:      float = 0.1,
         smooth_weight:  float = 1e-3,
+        los_transmission_w: float = 0.0,   # auxiliary LOS Lyα transmission constraint
+        los_target:     str = "tigm",      # "tigm" | "lya"
     ):
         super().__init__()
         self.w = {
@@ -150,9 +157,11 @@ class PINNLoss(torch.nn.Module):
             "mcf":     mcf_w,
             "xhii":    global_xhii_w,
             "prior":   prior_w,
+            "los":     los_transmission_w,
         }
         self.lf_weight     = lf_weight
         self.smooth_weight = smooth_weight
+        self.los_target    = los_target
 
     def forward(
         self,
@@ -160,6 +169,7 @@ class PINNLoss(torch.nn.Module):
         x_true: torch.Tensor,      # (G, G, G)
         xi_global: float,
         unresolved_module,         # for prior loss
+        graph=None,                # PyG Data (for LOS transmission target marks)
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """
         Returns: (total_loss, loss_components_dict)
@@ -177,6 +187,13 @@ class PINNLoss(torch.nn.Module):
             unresolved_module, J_unres,
             self.lf_weight, self.smooth_weight
         ) * self.w["prior"]
+
+        # Auxiliary: LOS Lyα transmission (T_IGM_hat vs observed).  Does NOT replace
+        # the field loss; only active when weight>0, the model produced T_IGM_hat,
+        # and the graph carries the observed marks.
+        if self.w["los"] > 0 and ("T_IGM_hat" in model_out) and (graph is not None):
+            losses["los"] = los_transmission_loss(
+                model_out, graph, target=self.los_target) * self.w["los"]
 
         total = sum(losses.values())
         return total, {k: float(v.item()) for k, v in losses.items()}
