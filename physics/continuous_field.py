@@ -54,6 +54,7 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 try:  # package-relative (python -m ... from repo root) or flat sys.path
     from .kernels import make_3d_kernel_grid
@@ -156,6 +157,134 @@ def kernel_norm_Z(
     return kernel(r).sum() + 1e-12
 
 
+# ------------------------------------------------------------------ #
+#  Neighbour-list acceleration (torch_cluster.radius)
+# ------------------------------------------------------------------ #
+#  For a cutoff r_cut the kernel/top-hat sum only needs source-query pairs within
+#  r_cut, turning O(Q*N) into O(Q*<neighbours>).  Periodicity is handled by ghost
+#  replication (sources within r_cut of a face get a wrapped copy), so a plain
+#  (non-periodic) radius search reproduces the minimum-image neighbours.
+#
+#  I could not run torch/torch_cluster in the dev sandbox, so every use is guarded
+#  by a runtime SELF-CHECK against the dense path on a small query subsample; on
+#  any mismatch or missing dependency it falls back to dense+checkpoint (verified).
+
+_NEIGHBOR_WARNED: set = set()
+
+
+def _warn_once(key, msg: str) -> None:
+    if key not in _NEIGHBOR_WARNED:
+        _NEIGHBOR_WARNED.add(key)
+        import warnings
+        warnings.warn(msg, RuntimeWarning)
+
+
+def _use_neighbors(neighbor_list, r_cut_mpc) -> bool:
+    """Decide whether to attempt the neighbour-list path."""
+    if r_cut_mpc is None:
+        return False                      # no cutoff -> neighbour list is not applicable
+    if neighbor_list is False or neighbor_list == "off":
+        return False
+    if neighbor_list is True or neighbor_list == "on":
+        return True
+    # "auto": use if torch_cluster is importable
+    try:
+        import torch_cluster  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _build_ghost_sources(src_pos: torch.Tensor, r_cut_norm: float):
+    """
+    Periodic ghost images of sources within ``r_cut_norm`` of a box face.  With
+    r_cut_norm < 0.5 each axis contributes at most one wrapped copy, so a plain
+    radius search over query in [0,1) and these ghosts reproduces the minimum-image
+    neighbours.  Returns (ghost_pos (M,3) [grad via src_pos], ghost_to_real (M,)).
+    """
+    N = src_pos.shape[0]
+    device = src_pos.device
+    dtype = src_pos.dtype
+    base = torch.arange(N, device=device)
+    axis_shifts = []
+    for ax in range(3):
+        c = src_pos[:, ax]
+        axis_shifts.append([
+            (0.0, torch.ones(N, dtype=torch.bool, device=device)),
+            (1.0, c <= r_cut_norm),                 # near low face -> ghost above 1
+            (-1.0, c >= 1.0 - r_cut_norm),          # near high face -> ghost below 0
+        ])
+    pos_list, idx_list = [], []
+    for sx, mx in axis_shifts[0]:
+        for sy, my in axis_shifts[1]:
+            for sz, mz in axis_shifts[2]:
+                m = mx & my & mz
+                if bool(m.any()):
+                    shift = torch.tensor([sx, sy, sz], device=device, dtype=dtype)
+                    pos_list.append(src_pos[m] + shift)
+                    idx_list.append(base[m])
+    return torch.cat(pos_list, 0), torch.cat(idx_list, 0)
+
+
+def _neighbor_pairs_periodic(query, src_pos, r_cut_norm, max_neighbors):
+    """
+    (q_idx, real_src_idx, r_norm) for source-query pairs within r_cut (periodic).
+    ``r_norm`` carries grad via src_pos (for the optional RSD position head).
+    Raises ImportError if torch_cluster is unavailable.
+    """
+    from torch_cluster import radius
+    ghost_pos, g2r = _build_ghost_sources(src_pos, r_cut_norm)
+    # radius(x, y, r): for each point in y, neighbours in x. row0 -> y (query),
+    # row1 -> x (ghost).  Search on detached coords; gather grad-carrying for r.
+    assign = radius(ghost_pos.detach(), query.detach(), r=float(r_cut_norm),
+                    max_num_neighbors=int(max_neighbors))
+    q_idx, g_idx = assign[0], assign[1]
+    dr = query[q_idx] - ghost_pos[g_idx]
+    return q_idx, g2r[g_idx], dr.norm(dim=-1)
+
+
+def _selfcheck_close(a_sub: torch.Tensor, b_sub: torch.Tensor,
+                     rtol: float = 1e-3, atol: float = 1e-6) -> bool:
+    return bool(torch.allclose(a_sub.detach(), b_sub.detach(), rtol=rtol, atol=atol))
+
+
+def _run_chunked(chunk_fn, query: torch.Tensor, chunk: int, checkpoint: bool,
+                 *grad_tensors) -> torch.Tensor:
+    """
+    Apply ``chunk_fn(q_chunk, *grad_tensors)`` over query chunks and concatenate.
+    When grad is enabled and ``checkpoint`` is set, each chunk is wrapped in
+    gradient checkpointing (non-reentrant) so its intermediates are freed after
+    the forward and recomputed in backward -- capping RETAINED autograd memory at
+    O(chunk * N) instead of O(Q * N).  That is what makes a full-grid render
+    (Q = G^3) with many sources fit in memory.  ``grad_tensors`` are passed as
+    explicit checkpoint inputs; any module parameters used inside ``chunk_fn`` are
+    tracked automatically by the non-reentrant implementation.
+    """
+    use_cp = checkpoint and torch.is_grad_enabled()
+    parts: list[torch.Tensor] = []
+    for s in range(0, query.shape[0], chunk):
+        q = query[s:s + chunk]
+        if use_cp:
+            parts.append(_torch_checkpoint(chunk_fn, q, *grad_tensors, use_reentrant=False))
+        else:
+            parts.append(chunk_fn(q, *grad_tensors))
+    return torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+
+
+def _kernel_sum_neighbors(query, src_pos, src_w, kernel, L, soft_norm,
+                          r_cut_norm, chunk, max_neighbors) -> torch.Tensor:
+    """Sparse kernel sum over torch_cluster neighbours (pre-Z), chunked over queries."""
+    parts: list[torch.Tensor] = []
+    for s in range(0, query.shape[0], chunk):
+        q = query[s:s + chunk]
+        q_idx, s_idx, r = _neighbor_pairs_periodic(q, src_pos, r_cut_norm, max_neighbors)
+        kvals = kernel(r.clamp(min=soft_norm) * L)            # (E,)
+        contrib = kvals * src_w[s_idx]                        # (E,) grad -> src_w, kernel
+        out_c = torch.zeros(q.shape[0], device=q.device, dtype=contrib.dtype)
+        parts.append(out_c.scatter_add(0, q_idx, contrib))
+    return torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+
+
 def kernel_sum_field(
     query: torch.Tensor,        # (Q, 3) normalised [0, 1)
     src_pos: torch.Tensor,      # (N, 3) normalised [0, 1)
@@ -166,27 +295,51 @@ def kernel_sum_field(
     Z: torch.Tensor,
     r_cut_mpc: float | None = None,
     chunk: int = 4096,
+    checkpoint: bool = True,
+    neighbor_list="auto",
+    neighbor_max: int = 8192,
 ) -> torch.Tensor:
     """
     J(q) = (1/Z) SUM_i src_w_i K(|q - x_i|_periodic, clamped)   -> (Q,)
 
-    Differentiable w.r.t. src_w (GNN factors) and the kernel parameters.  Query
-    points are processed in chunks (results concatenated, NOT slice-assigned, so
-    autograd stays intact).  ``r_cut_mpc`` masks far pairs (kernels decay).
+    Differentiable w.r.t. src_w (GNN factors) and the kernel parameters.
+
+    Two evaluation paths:
+      * neighbour list (torch_cluster.radius) when a cutoff ``r_cut_mpc`` is set --
+        O(Q*<neighbours>) memory & flops.  Guarded by a runtime self-check vs the
+        dense path on a small subsample; falls back on mismatch / missing dep.
+      * dense chunked sum with gradient ``checkpoint`` (default) -- O(chunk*N)
+        retained memory, works without a cutoff.
     """
     L = box_size
     soft_norm = softening_mpc / L
     r_cut_norm = (r_cut_mpc / L) if r_cut_mpc is not None else None
-    parts: list[torch.Tensor] = []
-    for s in range(0, query.shape[0], chunk):
-        q = query[s:s + chunk]                  # (q, 3)
+
+    def _dense_chunk(q: torch.Tensor, src_w_: torch.Tensor) -> torch.Tensor:
         d = minimum_image_delta(q, src_pos)     # (q, N, 3) normalised
         r = d.norm(dim=-1).clamp(min=soft_norm) # (q, N) normalised separation
         kvals = kernel(r * L)                    # (q, N) — kernel wants cMpc/h
         if r_cut_norm is not None:
             kvals = torch.where(r <= r_cut_norm, kvals, torch.zeros_like(kvals))
-        parts.append((kvals * src_w[None, :]).sum(dim=1))
-    out = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+        return (kvals * src_w_[None, :]).sum(dim=1)
+
+    if _use_neighbors(neighbor_list, r_cut_mpc):
+        try:
+            out = _kernel_sum_neighbors(query, src_pos, src_w, kernel, L, soft_norm,
+                                        r_cut_norm, chunk, neighbor_max)
+            Q = query.shape[0]
+            idx = torch.randperm(Q, device=query.device)[:min(128, Q)]
+            if _selfcheck_close(out[idx], _dense_chunk(query[idx], src_w)):
+                return out / Z
+            _warn_once(("ksum", id(kernel)),
+                       "continuous_field: neighbour-list kernel sum disagreed with dense; "
+                       "falling back to dense+checkpoint (check torch_cluster.radius / r_cut).")
+        except Exception as e:
+            _warn_once(("ksum_err", id(kernel)),
+                       f"continuous_field: neighbour list unavailable ({type(e).__name__}: {e}); "
+                       "using dense+checkpoint.")
+
+    out = _run_chunked(_dense_chunk, query, chunk, checkpoint, src_w)
     return out / Z
 
 
@@ -199,6 +352,9 @@ def render_obs_field_on_grid(
     softening_mpc: float | None = None,
     r_cut_mpc: float | None = None,
     chunk: int = 4096,
+    checkpoint: bool = True,
+    neighbor_list="auto",
+    neighbor_max: int = 8192,
 ) -> torch.Tensor:
     """
     Render the continuous observed radiation field J_obs(x) = SUM_i w_i K(|x-x_i|)
@@ -219,7 +375,8 @@ def render_obs_field_on_grid(
     Z = kernel_norm_Z(kernel, G, box_size, device, dtype=dtype)
     q = grid_centre_coords(G, device, dtype)
     J = kernel_sum_field(q, src_pos, src_w, kernel, box_size, soft, Z,
-                         r_cut_mpc=r_cut_mpc, chunk=chunk)
+                         r_cut_mpc=r_cut_mpc, chunk=chunk, checkpoint=checkpoint,
+                         neighbor_list=neighbor_list, neighbor_max=neighbor_max)
     return J.reshape(G, G, G)
 
 
@@ -253,6 +410,9 @@ def bubble_field_continuous(
     density_grid: torch.Tensor | None,  # (G,G,G) n_H ∝ (1+δ); None → uniform
     box_size: float,
     chunk: int = 4096,
+    checkpoint: bool = True,
+    neighbor_list="auto",
+    neighbor_max: int = 8192,
 ) -> torch.Tensor:
     """Continuous excursion-set bubble x_HII at arbitrary query points -> (Q,)."""
     device = query.device
@@ -284,22 +444,65 @@ def bubble_field_continuous(
             torch.fft.irfftn(H_fft * K_fft, s=n_H.shape, dim=dims).clamp(min=1e-8))
         counts.append((th[j] > 0).sum().to(dtype).clamp(min=1.0))   # voxels within R_j
 
-    parts: list[torch.Tensor] = []
-    for c in range(0, query.shape[0], chunk):
-        q = query[c:c + chunk]
+    A_obs_t = (A_obs if torch.is_tensor(A_obs)
+               else torch.as_tensor(A_obs, device=device, dtype=dtype))
+
+    def _dense_chunk(q, src_w_, A_obs_, zeta_, s_sharp_):
         d = minimum_image_delta(q, src_pos)
         r_mpc = d.norm(dim=-1) * L                              # (q, N) cMpc/h
         log_one_minus_p = torch.zeros(q.shape[0], device=device, dtype=dtype)
         for j, R in enumerate(radii):
             within = (r_mpc <= float(R)).to(dtype)             # hard top-hat (radii fixed)
-            S_obs_bar = (within * src_w[None, :]).sum(dim=1) / counts[j]
+            S_obs_bar = (within * src_w_[None, :]).sum(dim=1) / counts[j]
             S_unr_bar = periodic_trilinear_sample(S_unr_bar_grids[j], q)
             H_bar = periodic_trilinear_sample(H_bar_grids[j], q).clamp(min=1e-8)
-            Q = zeta * (A_obs * S_obs_bar + S_unr_bar) / H_bar
-            p = torch.sigmoid(s_sharp * (Q - 1.0)).clamp(max=1 - 1e-6)
+            Q = zeta_ * (A_obs_ * S_obs_bar + S_unr_bar) / H_bar
+            p = torch.sigmoid(s_sharp_ * (Q - 1.0)).clamp(max=1 - 1e-6)
             log_one_minus_p = log_one_minus_p + torch.log1p(-p)
-        parts.append(1.0 - torch.exp(log_one_minus_p))
-    return torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+        return 1.0 - torch.exp(log_one_minus_p)
+
+    # Neighbour-list path: a source contributes if within the LARGEST radius; each
+    # scale then masks by |r| <= R_j.  Guarded by a self-check vs dense.
+    r_cut_mpc = float(max(radii))
+    if _use_neighbors(neighbor_list, r_cut_mpc):
+        r_cut_norm = r_cut_mpc / L
+
+        def _nbr():
+            parts = []
+            for s in range(0, query.shape[0], chunk):
+                q = query[s:s + chunk]
+                q_idx, s_idx, r = _neighbor_pairs_periodic(q, src_pos, r_cut_norm, neighbor_max)
+                r_mpc = r * L
+                w = src_w[s_idx]
+                log_one_minus_p = torch.zeros(q.shape[0], device=device, dtype=dtype)
+                for j, R in enumerate(radii):
+                    within = (r_mpc <= float(R)).to(dtype)
+                    S_obs_bar = torch.zeros(q.shape[0], device=device, dtype=dtype)
+                    S_obs_bar = S_obs_bar.scatter_add(0, q_idx, within * w) / counts[j]
+                    S_unr_bar = periodic_trilinear_sample(S_unr_bar_grids[j], q)
+                    H_bar = periodic_trilinear_sample(H_bar_grids[j], q).clamp(min=1e-8)
+                    Qv = zeta * (A_obs_t * S_obs_bar + S_unr_bar) / H_bar
+                    p = torch.sigmoid(s_sharp * (Qv - 1.0)).clamp(max=1 - 1e-6)
+                    log_one_minus_p = log_one_minus_p + torch.log1p(-p)
+                parts.append(1.0 - torch.exp(log_one_minus_p))
+            return torch.cat(parts, 0) if len(parts) > 1 else parts[0]
+
+        try:
+            out = _nbr()
+            Qn = query.shape[0]
+            idx = torch.randperm(Qn, device=query.device)[:min(128, Qn)]
+            ref = _dense_chunk(query[idx], src_w, A_obs_t, zeta, s_sharp)
+            if _selfcheck_close(out[idx], ref):
+                return out
+            _warn_once(("bubble", id(bubble)),
+                       "continuous_field: neighbour-list bubble disagreed with dense; "
+                       "falling back to dense+checkpoint.")
+        except Exception as e:
+            _warn_once(("bubble_err", id(bubble)),
+                       f"continuous_field: neighbour list unavailable ({type(e).__name__}: {e}); "
+                       "using dense+checkpoint.")
+
+    return _run_chunked(_dense_chunk, query, chunk, checkpoint, src_w, A_obs_t, zeta, s_sharp)
 
 
 def render_bubble_on_grid(
@@ -312,12 +515,17 @@ def render_bubble_on_grid(
     box_size: float,
     grid_size: int | None = None,
     chunk: int = 4096,
+    checkpoint: bool = True,
+    neighbor_list="auto",
+    neighbor_max: int = 8192,
 ) -> torch.Tensor:
     """Render the continuous bubble x_HII onto a grid_size^3 cube (any resolution)."""
     G = grid_size if grid_size is not None else bubble.grid_size
     q = grid_centre_coords(G, src_pos.device, src_pos.dtype)
     x = bubble_field_continuous(bubble, q, src_pos, src_w, A_obs,
-                                S_unres_grid, density_grid, box_size, chunk=chunk)
+                                S_unres_grid, density_grid, box_size,
+                                chunk=chunk, checkpoint=checkpoint,
+                                neighbor_list=neighbor_list, neighbor_max=neighbor_max)
     return x.reshape(G, G, G)
 
 
@@ -437,24 +645,25 @@ class ContinuousIonizationField(nn.Module):
         r_cut_mpc: float | None = None,
         chunk: int = 4096,
         normalise: bool = True,
+        checkpoint: bool = True,
     ) -> torch.Tensor:
         """
         Continuous observed radiation field at the query points.
 
         J_obs(q) = (1/Z) SUM_i w_i K(|q - x_i|_periodic, clamped)
 
-        Memory is bounded by processing the query points in chunks of ``chunk``.
-        If ``r_cut_mpc`` is given, source pairs beyond the cutoff are masked
-        (the kernels decay, so a few x lambda / R is sufficient); this turns the
-        cost from O(Q*N) into O(Q*<neighbours>) in flops via masking.  A true
-        neighbour list (torch_cluster.radius) is a drop-in future optimisation.
+        Memory is bounded by processing the query points in chunks of ``chunk`` and,
+        when grad is enabled and ``checkpoint`` is set, gradient checkpointing so the
+        RETAINED graph is O(chunk*N) not O(Q*N).  If ``r_cut_mpc`` is given, source
+        pairs beyond the cutoff are masked (the kernels decay); a true neighbour list
+        (torch_cluster.radius) is a drop-in further optimisation.
         """
         device = query.device
         Z = (self.kernel_norm_constant(device, dtype=query.dtype)
              if normalise else torch.ones((), device=device, dtype=query.dtype))
         return kernel_sum_field(
             query, src_pos, src_w, self.kernel, self.box_size,
-            self.softening_mpc, Z, r_cut_mpc=r_cut_mpc, chunk=chunk,
+            self.softening_mpc, Z, r_cut_mpc=r_cut_mpc, chunk=chunk, checkpoint=checkpoint,
         )
 
     # -------------------------------------------------------------- #
@@ -471,6 +680,7 @@ class ContinuousIonizationField(nn.Module):
         r_cut_mpc: float | None = None,
         chunk: int = 4096,
         return_J: bool = False,
+        checkpoint: bool = True,
     ) -> dict[str, torch.Tensor]:
         """
         Returns dict with ``x_hii`` (Q,) and optionally ``J`` (Q,).
@@ -483,7 +693,8 @@ class ContinuousIonizationField(nn.Module):
         unresolved source field ALREADY convolved with the kernel (by linearity
         this equals the unresolved part of the grid J_total).
         """
-        J_obs = self.source_field(query, src_pos, src_w, r_cut_mpc=r_cut_mpc, chunk=chunk)
+        J_obs = self.source_field(query, src_pos, src_w, r_cut_mpc=r_cut_mpc,
+                                  chunk=chunk, checkpoint=checkpoint)
         if J_unres_grid is not None:
             J = J_obs + periodic_trilinear_sample(J_unres_grid, query)
         else:

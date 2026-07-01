@@ -272,11 +272,21 @@ python -m experiments.run_mvp ... --excursion bubble_equilibrium
 
 ## 9. Limitations and next steps
 
-- **Cost.** The kernel sum is `O(Q·N)` (bubble: `× n_scales`); query points are
-  chunked to bound memory, and `r_cut_mpc` masks far pairs (the equilibrium kernels
-  decay; the bubble top-hats are already compact). A neighbour list
-  (`torch_cluster.radius`) is a drop-in to reach `O(Q·⟨neighbours⟩)` and is the
-  main optimisation if continuous-bubble training is too slow at `512³`.
+- **Cost & memory.** The kernel/top-hat sum is `O(Q·N)` (bubble: `× n_scales`).
+  For a full-grid render `Q = G³` the naive autograd graph is `O(G³·N)` — at
+  `G=64, N~10⁴` that is ~60 GiB and OOMs. Two mitigations, both default-on:
+  - **Gradient checkpointing** (`checkpoint: true`) recomputes each query chunk in
+    backward so the retained graph is only `O(chunk·N)` (≈1.3× compute).
+  - **Neighbour list** (`neighbor_list: auto`, needs `torch_cluster` + a cutoff
+    `r_cut_mpc`): `torch_cluster.radius` with periodic **ghost replication** gives
+    `O(Q·⟨neighbours⟩)` in memory *and* flops (~8× fewer at `r_cut=50` in a 160
+    box). A runtime **self-check** compares against the dense path on a small
+    subsample and falls back automatically on any mismatch / missing dep, so it can
+    never produce a wrong field. The ghost/cutoff math is verified to `1e-13` vs
+    the dense minimum-image sum.
+
+  Further knobs: lower `chunk`, tighten `r_cut_mpc`, or fall back to
+  `field_generator: grid`.
 - **Bubble mapping (implemented).** `bubble_field_continuous` evaluates the
   multi-scale excursion-set threshold continuously: observed sources via exact
   per-scale top-hat kernel sums, `S_unres` / `n_H` via grid-smoothing + interp.

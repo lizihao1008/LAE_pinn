@@ -256,8 +256,8 @@ def main(args=None):
 
     yaml_cfg = getattr(args, "_yaml_cfg", None)
     if yaml_cfg is not None:
-        cfg_for_model = dict(yaml_cfg)
-        cfg_for_model.setdefault("data", {})["grid_mvp"] = args.grid
+        from config.load_config import sync_mvp_args_into_config
+        cfg_for_model = sync_mvp_args_into_config(yaml_cfg, args)
         cfg_for_model.setdefault("data", {})["box_size_mpc"] = snap.box_size
         cfg_for_model.setdefault("unresolved_sources", {})["n_hod_bins"] = n_hod_bins
         cfg_for_model.setdefault("excursion_set", {})["alpha_nH_scale_init"] = alpha_init
@@ -281,9 +281,9 @@ def main(args=None):
             field_generator=args.field_generator,
         )
     print(f"  Ionization core: {args.excursion}")
-    print(f"  Field generator: {args.field_generator}"
-          + ("  (mesh-free; ~n_scales×G³·N per step for bubble)"
-             if args.field_generator == "continuous" and args.excursion == "bubble" else ""))
+    print(f"  Field generator: {model.field_generator}"
+          + ("  (mesh-free off-grid queries; grid training uses scatter+FFT)"
+             if model.field_generator == "continuous" else ""))
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Trainable parameters: {n_params:,}")
 

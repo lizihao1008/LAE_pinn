@@ -83,6 +83,35 @@ def mvp_settings_from_config(cfg: dict) -> argparse.Namespace:
     )
 
 
+def sync_mvp_args_into_config(cfg: dict, args: argparse.Namespace) -> dict:
+    """
+    Merge resolved MVP argparse settings back into the YAML dict so
+    ``build_pinn_from_config`` sees the same values as ``args`` (including CLI overrides).
+    """
+    out = dict(cfg)
+    out["field_generator"] = args.field_generator
+    cf = dict(out.get("continuous_field", {}))
+    cf["generator"] = args.field_generator
+    out["continuous_field"] = cf
+
+    exc = dict(out.get("excursion_set", {}))
+    exc["type"] = args.excursion
+    out["excursion_set"] = exc
+
+    unr = dict(out.get("unresolved_sources", {}))
+    unr["model"] = args.unresolved
+    unr["dv_max_kms"] = args.dv_max
+    unr["n_lae_mass_bins"] = args.n_lae_mass_bins
+    unr["profile_source"] = args.profile_source
+    out["unresolved_sources"] = unr
+
+    data = dict(out.get("data", {}))
+    data["grid_mvp"] = args.grid
+    data["muv_cut"] = args.muv_cut
+    out["data"] = data
+    return out
+
+
 def training_cfg_from_yaml(cfg: dict, n_epochs: int | None = None) -> dict:
     """Training loop config dict for training.train.train()."""
     train = cfg.get("training", {})

@@ -62,12 +62,25 @@ kernel:
 #                          query x_HII at arbitrary coordinates (model.continuous_field()).
 #   grid                 — legacy trilinear scatter + FFT convolution.
 # Identical on-grid for on-grid sources; A_obs / J_ref calibration unchanged.
-# (Bubble excursion always uses the scatter path; continuous SDF variant is future work.)
+# Supports both equilibrium and bubble/bubble_equilibrium cores (bubble uses
+# per-scale top-hat kernel sums for the observed sources).
 field_generator: continuous
 continuous_field:
   generator: continuous     # "continuous" | "grid"  (overrides field_generator if set)
-  r_cut_mpc: 50           # optional cutoff (cMpc/h) for the kernel sum; null = full sum
-  chunk: 4096               # query-point chunk size (memory control)
+  r_cut_mpc: 50             # optional cutoff (cMpc/h) for the kernel sum; null = full sum
+  chunk: 4096               # query-point chunk size (lower to reduce peak memory)
+  # Gradient checkpointing: recompute each query chunk in backward so the RETAINED
+  # autograd graph is O(chunk·N) not O(G³·N). Keep TRUE for full-grid training with
+  # many sources (else ~62 GiB OOM at G=64, N~1e4). false = ~1.3× less compute if
+  # memory is ample.
+  checkpoint: true
+  # Neighbour-list acceleration (needs torch_cluster AND a cutoff r_cut_mpc):
+  # O(Q·<neighbours>) instead of O(Q·N) in both memory and flops. "auto" uses it
+  # when torch_cluster is importable; a runtime self-check vs the dense path falls
+  # back automatically on any mismatch / missing dep, so it can never produce a
+  # wrong field. Set false to force dense+checkpoint.
+  neighbor_list: auto
+  neighbor_max: 8192        # cap on neighbours per query in torch_cluster.radius
 
 unresolved_sources:
   # HOD-based faint source model.  Basis fields are pre-computed once before

@@ -106,6 +106,15 @@ class LAEPINN(nn.Module):
         field_generator: str = "continuous",
         continuous_r_cut_mpc: float | None = None,
         continuous_chunk: int = 4096,
+        # Gradient checkpointing for the continuous render: recompute each query
+        # chunk in backward so the retained autograd graph is O(chunk·N) not
+        # O(G³·N).  Essential to fit a full-grid render with many sources on GPU.
+        continuous_checkpoint: bool = True,
+        # Neighbour-list acceleration (torch_cluster.radius) when a cutoff is set:
+        # O(Q·<neighbours>) instead of O(Q·N).  "auto" uses it if torch_cluster is
+        # importable; a runtime self-check falls back to dense on any mismatch.
+        continuous_neighbor_list="auto",
+        continuous_neighbor_max: int = 8192,
     ):
         super().__init__()
 
@@ -115,6 +124,9 @@ class LAEPINN(nn.Module):
         self.field_generator = field_generator
         self.cf_r_cut = continuous_r_cut_mpc
         self.cf_chunk = continuous_chunk
+        self.cf_checkpoint = continuous_checkpoint
+        self.cf_neighbor = continuous_neighbor_list
+        self.cf_neighbor_max = continuous_neighbor_max
 
         # --- GNN encoder ---
         self.gnn = build_gnn_encoder(
@@ -322,7 +334,9 @@ class LAEPINN(nn.Module):
             if self.field_generator == "continuous":
                 J_obs_grid   = render_obs_field_on_grid(
                     self.kernel, pos_scatter, w_eff, G, self.box_size,
-                    r_cut_mpc=self.cf_r_cut, chunk=self.cf_chunk)
+                    r_cut_mpc=self.cf_r_cut, chunk=self.cf_chunk,
+                    checkpoint=self.cf_checkpoint,
+                    neighbor_list=self.cf_neighbor, neighbor_max=self.cf_neighbor_max)
                 J_unres_grid = fft_convolve_3d(S_unres, kernel_grid)
                 if not bool(self._amp_calibrated):
                     with torch.no_grad():
@@ -344,7 +358,9 @@ class LAEPINN(nn.Module):
                 J_ref = self._J_ref
                 B     = render_bubble_on_grid(
                     self.excursion.bubble, pos_scatter, w_eff, A_obs, S_unres,
-                    density_grid, self.box_size, grid_size=G, chunk=self.cf_chunk)
+                    density_grid, self.box_size, grid_size=G, chunk=self.cf_chunk,
+                    checkpoint=self.cf_checkpoint,
+                    neighbor_list=self.cf_neighbor, neighbor_max=self.cf_neighbor_max)
                 x_eq  = self.excursion.equilibrium(J_total / J_ref)
                 x_hii_pred  = (B * x_eq).clamp(0.0, 1.0)
                 S_obs       = J_obs_grid                          # diagnostics
@@ -397,6 +413,8 @@ class LAEPINN(nn.Module):
             x_hii_pred = render_bubble_on_grid(
                 self.excursion, pos_scatter, w_eff, A_obs, S_unres,
                 density_grid, self.box_size, grid_size=G, chunk=self.cf_chunk,
+                checkpoint=self.cf_checkpoint,
+                neighbor_list=self.cf_neighbor, neighbor_max=self.cf_neighbor_max,
             )
             J_ref = self._J_ref
             # diagnostics only (NOT used for x_HII): emissivity grid via cheap scatter
@@ -414,6 +432,8 @@ class LAEPINN(nn.Module):
             J_obs_grid   = render_obs_field_on_grid(
                 self.kernel, pos_scatter, w_eff, G, self.box_size,
                 r_cut_mpc=self.cf_r_cut, chunk=self.cf_chunk,
+                checkpoint=self.cf_checkpoint,
+                neighbor_list=self.cf_neighbor, neighbor_max=self.cf_neighbor_max,
             )                                              # (G,G,G) observed radiation field
             J_unres_grid = fft_convolve_3d(S_unres, kernel_grid)
             if not bool(self._amp_calibrated):
@@ -587,4 +607,7 @@ def build_pinn_from_config(cfg: dict) -> LAEPINN:
         field_generator=field_generator,
         continuous_r_cut_mpc=cf_cfg.get("r_cut_mpc", None),
         continuous_chunk=cf_cfg.get("chunk", 4096),
+        continuous_checkpoint=cf_cfg.get("checkpoint", True),
+        continuous_neighbor_list=cf_cfg.get("neighbor_list", "auto"),
+        continuous_neighbor_max=cf_cfg.get("neighbor_max", 8192),
     )
