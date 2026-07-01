@@ -8,6 +8,10 @@ Usage:
         --patch_dir ../simulation/patches_z7.14 \\
         --epochs 50
 
+    # YAML + CLI overrides (same pattern as run_mvp):
+    python -m experiments.run_patches --config --patch_dir ../simulation/patches_z7.14 \\
+        --field_generator grid --epochs 1000
+
 Each epoch iterates over every training patch (one gradient step per patch).
 Evaluation averages field metrics over the held-out test patches.
 """
@@ -26,36 +30,86 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.loader import load_snapshot
 from data.patch_loader import build_graph_list_from_patches, load_manifest
-from models.pinn import LAEPINN
+from models.pinn import LAEPINN, build_pinn_from_config
 from training.train import train
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train LAEPINN on patch dataset")
-    p.add_argument("--patch_dir", required=True,
+    p = argparse.ArgumentParser(
+        description="Train LAEPINN on patch dataset",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--config", nargs="?", const="config/default.yaml", default=None,
+        metavar="YAML",
+        help="Load hyperparameters from YAML. CLI flags below override yaml values.",
+    )
+    p.add_argument("--patch_dir", default=argparse.SUPPRESS,
                    help="Root written by make_train_data.py (contains train/, test/)")
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--save_dir", default="runs/patches")
-    p.add_argument("--muv_cut", type=float, default=-17.5)
-    p.add_argument("--k_neighbors", type=int, default=16)
-    p.add_argument("--r_link", type=float, default=15.0)
-    p.add_argument("--subsample", type=int, default=None,
+    p.add_argument("--epochs", type=int, default=argparse.SUPPRESS)
+    p.add_argument("--lr", type=float, default=argparse.SUPPRESS)
+    p.add_argument("--device", default=argparse.SUPPRESS)
+    p.add_argument("--save_dir", default=argparse.SUPPRESS)
+    p.add_argument("--muv_cut", type=float, default=argparse.SUPPRESS)
+    p.add_argument("--k_neighbors", type=int, default=argparse.SUPPRESS)
+    p.add_argument("--r_link", type=float, default=argparse.SUPPRESS)
+    p.add_argument("--subsample", type=int, default=argparse.SUPPRESS,
                    help="Max halos per patch graph (None = all)")
-    p.add_argument("--max_train", type=int, default=None,
+    p.add_argument("--max_train", type=int, default=argparse.SUPPRESS,
                    help="Limit number of training patches (debug)")
-    p.add_argument("--max_test", type=int, default=None,
+    p.add_argument("--max_test", type=int, default=argparse.SUPPRESS,
                    help="Limit number of test patches for eval (debug)")
-    p.add_argument("--excursion", choices=["equilibrium", "bubble"], default="equilibrium")
-    p.add_argument("--sim_root", default="../simulation",
+    p.add_argument("--excursion", choices=["equilibrium", "bubble", "bubble_equilibrium"],
+                   default=argparse.SUPPRESS)
+    p.add_argument("--sim_root", default=argparse.SUPPRESS,
                    help="Full snapshot root (LF stats for conditional unresolved)")
-    p.add_argument("--unresolved", choices=["linear", "conditional"], default="linear")
+    p.add_argument("--unresolved", choices=["linear", "conditional"], default=argparse.SUPPRESS)
+    p.add_argument("--field_generator", choices=["continuous", "grid"], default=argparse.SUPPRESS)
     p.add_argument("--profile_source", choices=["observed_acf", "cof", "powerlaw"],
-                   default="observed_acf")
-    p.add_argument("--dv_max", type=float, default=1000.0)
-    p.add_argument("--n_lae_mass_bins", type=int, default=4)
-    return p.parse_args()
+                   default=argparse.SUPPRESS)
+    p.add_argument("--dv_max", type=float, default=argparse.SUPPRESS)
+    p.add_argument("--n_lae_mass_bins", type=int, default=argparse.SUPPRESS)
+    cli = p.parse_args()
+
+    if cli.config is not None:
+        from config.load_config import load_config, patch_settings_from_config
+        args = patch_settings_from_config(load_config(cli.config))
+        for k, v in vars(cli).items():
+            if k == "config" or v is None:
+                continue
+            setattr(args, k, v)
+        if args.patch_dir is None:
+            p.error("--patch_dir is required (or set patches.patch_dir in the yaml)")
+        return args
+
+    defaults = dict(
+        patch_dir=None,
+        epochs=50,
+        lr=1e-3,
+        device="cuda",
+        save_dir="runs/patches",
+        muv_cut=-17.5,
+        k_neighbors=16,
+        r_link=15.0,
+        subsample=None,
+        max_train=None,
+        max_test=None,
+        excursion="equilibrium",
+        sim_root="../simulation",
+        unresolved="linear",
+        field_generator="continuous",
+        profile_source="observed_acf",
+        dv_max=1000.0,
+        n_lae_mass_bins=4,
+        muv_faint_limit=-15.0,
+        muv_bin_step=0.5,
+        seed=None,
+        _yaml_cfg=None,
+    )
+    defaults.update({k: v for k, v in vars(cli).items() if k != "config"})
+    if defaults["patch_dir"] is None:
+        p.error("--patch_dir is required")
+    return argparse.Namespace(**defaults)
 
 
 def field_metrics(x_pred: np.ndarray, x_true: np.ndarray) -> dict:
@@ -82,17 +136,23 @@ def evaluate_graph_list(model, graphs, device) -> dict:
     return {k: float(np.mean([m[k] for m in metrics])) for k in keys}
 
 
-def main():
-    args = parse_args()
+def main(args=None):
+    if args is None:
+        args = parse_args()
     device = torch.device(args.device)
+
+    if getattr(args, "seed", None) is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
 
     manifest = load_manifest(args.patch_dir)
     redshift = float(manifest.get("redshift", 7.14))
     patch_grid = int(manifest.get("patch_grid", 64))
     patch_box = float(manifest.get("patch_box_mpc", 40.0))
 
-    muv_faint_limit = -15.0
-    muv_bin_edges = list(np.arange(args.muv_cut, muv_faint_limit + 1e-6, 0.5))
+    muv_faint_limit = getattr(args, "muv_faint_limit", -15.0)
+    muv_bin_step = getattr(args, "muv_bin_step", 0.5)
+    muv_bin_edges = list(np.arange(args.muv_cut, muv_faint_limit + 1e-6, muv_bin_step))
     n_hod_bins = len(muv_bin_edges)
 
     print(f"\n{'='*60}")
@@ -130,7 +190,6 @@ def main():
         args.patch_dir, "train", max_patches=args.max_train, **graph_kw,
     )
 
-    # xi_global for alpha init: mean over training patch targets
     xi_vals = [float(g.xi_global) for g in train_graphs]
     xi_val = float(np.mean(xi_vals))
     xi_clamped = max(min(xi_val, 0.995), 0.005)
@@ -138,38 +197,52 @@ def main():
     alpha_init = 1.0 / max(A_target, 1e-6)
     print(f"  mean patch xi_global = {xi_val:.3f}  →  alpha_init = {alpha_init:.2f}")
 
-    model = LAEPINN(
-        gnn_in_channels=8,
-        gnn_hidden_dim=64,
-        gnn_out_channels=32,
-        gnn_n_layers=3,
-        gnn_heads=4,
-        kernel_type="mixture",
-        n_hod_bins=n_hod_bins,
-        grid_size=patch_grid,
-        box_size=patch_box,
-        excursion_type=args.excursion,
-        alpha_nH_scale_init=alpha_init,
-    )
+    yaml_cfg = getattr(args, "_yaml_cfg", None)
+    if yaml_cfg is not None:
+        from config.load_config import sync_mvp_args_into_config, training_cfg_from_yaml
+        cfg_for_model = sync_mvp_args_into_config(yaml_cfg, args)
+        cfg_for_model.setdefault("data", {})["grid_mvp"] = patch_grid
+        cfg_for_model.setdefault("data", {})["box_size_mpc"] = patch_box
+        cfg_for_model.setdefault("unresolved_sources", {})["n_hod_bins"] = n_hod_bins
+        cfg_for_model.setdefault("excursion_set", {})["alpha_nH_scale_init"] = alpha_init
+        model = build_pinn_from_config(cfg_for_model)
+        cfg = training_cfg_from_yaml(yaml_cfg, n_epochs=args.epochs)
+    else:
+        model = LAEPINN(
+            gnn_in_channels=8,
+            gnn_hidden_dim=64,
+            gnn_out_channels=32,
+            gnn_n_layers=3,
+            gnn_heads=4,
+            kernel_type="mixture",
+            n_hod_bins=n_hod_bins,
+            grid_size=patch_grid,
+            box_size=patch_box,
+            excursion_type=args.excursion,
+            alpha_nH_scale_init=alpha_init,
+            field_generator=args.field_generator,
+        )
+        cfg = {
+            "training": {
+                "n_epochs": args.epochs,
+                "lr": args.lr,
+                "warmup_epochs": min(10, args.epochs // 5),
+                "weight_decay": 1e-5,
+                "loss_weights": {
+                    "field_mse": 1.0,
+                    "power_spectrum": 0.1,
+                    "binary_bce": 0.5,
+                    "global_xHII": 10.0,
+                    "prior": 0.1,
+                },
+            },
+            "experiment": {"log_every": max(1, args.epochs // 10)},
+        }
+
+    print(f"  Ionization core: {args.excursion}")
+    print(f"  Field generator: {model.field_generator}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Trainable parameters: {n_params:,}")
-
-    cfg = {
-        "training": {
-            "n_epochs": args.epochs,
-            "lr": args.lr,
-            "warmup_epochs": min(10, args.epochs // 5),
-            "weight_decay": 1e-5,
-            "loss_weights": {
-                "field_mse": 1.0,
-                "power_spectrum": 0.1,
-                "binary_bce": 0.5,
-                "global_xHII": 10.0,
-                "prior": 0.1,
-            },
-        },
-        "experiment": {"log_every": max(1, args.epochs // 10)},
-    }
 
     print(f"\nTraining: {len(train_graphs)} patches × {args.epochs} epochs "
           f"= {len(train_graphs) * args.epochs} steps\n")
@@ -208,6 +281,7 @@ def main():
         "muv_bin_edges": muv_bin_edges,
         "n_hod_bins": n_hod_bins,
         "excursion": args.excursion,
+        "field_generator": model.field_generator,
         "unresolved": args.unresolved,
         "profile_source": args.profile_source,
         "dv_max": args.dv_max,

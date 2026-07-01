@@ -163,6 +163,12 @@ mvp:
   save_subdir: mvp                      # output → runs/mvp/
   subsample: null                       # max halos in graph (null = all)
 
+# Patch training (python -m experiments.run_patches --config --patch_dir ...)
+patches:
+  save_subdir: patches                  # output → runs/patches/
+  max_train: null                       # limit train patches (debug)
+  max_test: null                        # limit test patches (debug)
+
 # ============================================================
 # Source degeneracy stress tests
 # ============================================================

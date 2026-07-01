@@ -83,6 +83,30 @@ def mvp_settings_from_config(cfg: dict) -> argparse.Namespace:
     )
 
 
+def patch_settings_from_config(cfg: dict) -> argparse.Namespace:
+    """Build argparse.Namespace for experiments.run_patches.main()."""
+    args = mvp_settings_from_config(cfg)
+    patches = cfg.get("patches", {})
+    exp = cfg.get("experiment", {})
+
+    if patches.get("patch_dir") is not None:
+        args.patch_dir = _resolve_path(patches["patch_dir"])
+    else:
+        args.patch_dir = None
+
+    save_root = exp.get("save_dir", "runs/")
+    save_sub = patches.get("save_subdir", "patches")
+    args.save_dir = _resolve_path(os.path.join(save_root.rstrip("/"), save_sub))
+
+    args.max_train = patches.get("max_train")
+    args.max_test = patches.get("max_test")
+    if args.max_train is not None:
+        args.max_train = int(args.max_train)
+    if args.max_test is not None:
+        args.max_test = int(args.max_test)
+    return args
+
+
 def sync_mvp_args_into_config(cfg: dict, args: argparse.Namespace) -> dict:
     """
     Merge resolved MVP argparse settings back into the YAML dict so
