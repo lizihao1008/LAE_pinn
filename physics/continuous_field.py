@@ -583,6 +583,22 @@ def build_continuous_field_from_pinn(
     # 3. Unresolved emissivity field.
     S_unres = model.unresolved(hod_basis)
 
+    # ---- Hybrid mapping: B(x) · x_eq(x) ----
+    if model.excursion_type == "bubble_equilibrium":
+        density_grid = getattr(graph, "density_grid", None)
+        kernel_grid = make_3d_kernel_grid(model.kernel, G, model.box_size, device)
+        J_unres_grid = fft_convolve_3d(S_unres, kernel_grid)
+        J_ref = model._J_ref if bool(model._amp_calibrated) else None
+        evaluator = HybridContinuousEvaluator(
+            model.excursion.bubble, model.excursion.equilibrium,
+            model.kernel, model.box_size, G)
+        ctx = {
+            "src_pos": pos, "src_w": w_eff, "A_obs": A_obs,
+            "S_unres_grid": S_unres, "J_unres_grid": J_unres_grid,
+            "J_ref": J_ref, "density_grid": density_grid,
+        }
+        return evaluator, ctx
+
     # ---- Bubble mapping: top-hat excursion-set evaluator ----
     if model.excursion_type == "bubble":
         density_grid = getattr(graph, "density_grid", None)
@@ -633,6 +649,35 @@ class BubbleContinuousEvaluator:
         x = bubble_field_continuous(self.bubble, query, src_pos, src_w, A_obs,
                                     S_unres_grid, density_grid, self.box_size, chunk=chunk)
         return {"x_hii": x}
+
+    __call__ = forward
+
+
+class HybridContinuousEvaluator:
+    """
+    Off-grid evaluator for the hybrid core:  x_HII(x) = B(x) · x_eq(x).
+      B(x)    — continuous excursion-set bubble (``bubble_field_continuous``).
+      x_eq(x) — continuous kernel-integral photoionization equilibrium
+                (``ContinuousIonizationField`` on the same propagated field J).
+    Matches the ``ev.forward(query, **ctx)["x_hii"]`` convention of the other cores.
+    """
+
+    def __init__(self, bubble, equilibrium, kernel, box_size: float, grid_size_ref: int):
+        self.bubble = bubble
+        self.box_size = box_size
+        self._cfield = ContinuousIonizationField(
+            kernel=kernel, excursion=equilibrium,
+            box_size=box_size, grid_size_ref=grid_size_ref)
+
+    def forward(self, query, src_pos, src_w, A_obs, S_unres_grid, J_unres_grid,
+                J_ref, density_grid=None, chunk: int = 4096):
+        B = bubble_field_continuous(self.bubble, query, src_pos, src_w, A_obs,
+                                    S_unres_grid, density_grid, self.box_size, chunk=chunk)
+        # equilibrium on J(query) = A_obs·Σ w_i K + interp(J_unres): pass A_obs·w_i
+        x_eq = self._cfield.forward(
+            query, src_pos, A_obs * src_w,
+            J_unres_grid=J_unres_grid, J_ref=J_ref, chunk=chunk)["x_hii"]
+        return {"x_hii": (B * x_eq).clamp(0.0, 1.0)}
 
     __call__ = forward
 

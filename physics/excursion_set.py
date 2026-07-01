@@ -278,3 +278,121 @@ class BubbleExcursionSet(nn.Module):
     def extra_repr(self) -> str:
         return (f"zeta={self.zeta.item():.3f}, sharpness={self.sharpness.item():.2f}, "
                 f"n_scales={len(self.radii_mpc)}")
+
+
+# ------------------------------------------------------------------ #
+#  Hybrid: excursion-set bubble topology × photoionization equilibrium
+# ------------------------------------------------------------------ #
+
+class HybridBubbleEquilibrium(nn.Module):
+    """
+    Two-phase reionization core:  x_HII(x) = B(x) * x_eq(x).
+
+        B(x)    — excursion-set bubble MEMBERSHIP (BubbleExcursionSet): the photon-
+                  budget topology (sharp 0/1, genuine neutral voids).  Answers
+                  "is this cell inside an ionized region?".
+        x_eq(x) — photoionization-EQUILIBRIUM ionized fraction (ExcursionSetMapping)
+                  on the propagated radiation field J:  x_eq = (sqrt(A^2+4A)-A)/2
+                  with A = (J/J_ref)/s.  The residual ionization INSIDE ionized gas.
+
+    Physical decomposition of the neutral fraction:
+        x_HI = (1 - B) * 1  +  B * x_HI_eq        (neutral outside bubbles;
+                                                   equilibrium residual inside)
+      =>  x_HII = B * (1 - x_HI_eq) = B * x_eq.
+
+    So the bubble sets WHERE gas is ionized (sharp topology, real voids), while
+    photoionization equilibrium sets HOW ionized it is inside (residual x_HI ~ s/J).
+    This is the standard semi-numerical topology + post-reionization UVB-residual
+    treatment (cf. 21cmFAST).
+
+    ``residual_scale_init`` is small by default so that x_eq ~ 1 inside bubbles
+    (high J): the hybrid then STARTS ~ the pure bubble model and refines the
+    interior residual during training.
+    """
+
+    def __init__(
+        self,
+        grid_size: int = 64,
+        box_size: float = 160.0,
+        radii_mpc: list[float] | None = None,
+        zeta_init: float = 1.0,
+        sharpness_init: float = 6.0,
+        residual_scale_init: float = 0.1,
+        learnable: bool = True,
+    ):
+        super().__init__()
+        self.grid_size = grid_size
+        self.box_size = box_size
+        self.bubble = BubbleExcursionSet(
+            grid_size=grid_size, box_size=box_size, radii_mpc=radii_mpc,
+            zeta_init=zeta_init, sharpness_init=sharpness_init, learnable=learnable,
+        )
+        self.equilibrium = ExcursionSetMapping(
+            alpha_nH_scale_init=residual_scale_init, learnable=learnable,
+        )
+
+    # convenience delegations
+    @property
+    def zeta(self) -> torch.Tensor:
+        return self.bubble.zeta
+
+    @property
+    def sharpness(self) -> torch.Tensor:
+        return self.bubble.sharpness
+
+    @property
+    def alpha_nH_scale(self) -> torch.Tensor:
+        return self.equilibrium.alpha_nH_scale
+
+    @property
+    def radii_mpc(self) -> list[float]:
+        return self.bubble.radii_mpc
+
+    def forward(
+        self,
+        S_emiss: torch.Tensor,       # (G,G,G) emissivity for the bubble photon-counting
+        J_norm: torch.Tensor,        # (G,G,G) J / J_ref (propagated field for equilibrium)
+        density: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """x_HII = B(S_emiss) * x_eq(J_norm)."""
+        B = self.bubble(S_emiss, density=density)
+        x_eq = self.equilibrium(J_norm)
+        return (B * x_eq).clamp(0.0, 1.0)
+
+    @torch.no_grad()
+    def calibrate_zeta(
+        self,
+        S_emiss: torch.Tensor,
+        J_norm: torch.Tensor,
+        density: torch.Tensor | None = None,
+        target: float = 0.5,
+        n_iter: int = 40,
+    ) -> None:
+        """
+        One-time calibration: bisect the bubble zeta so <B * x_eq> = target.
+        x_eq is held fixed (depends on the residual scale s and J_ref, not zeta),
+        so this is a clean 1-D bisection on the topology amplitude.
+        """
+        x_eq = self.equilibrium(J_norm).detach()
+        lo = torch.tensor(-12.0)
+        hi = torch.tensor(12.0)
+        for _ in range(n_iter):
+            mid = (lo + hi) / 2
+            self.bubble._zeta_raw.data.copy_(
+                _softplus_inverse(mid.exp()).to(self.bubble._zeta_raw.dtype))
+            xm = (self.bubble(S_emiss, density=density) * x_eq).mean().item()
+            if xm > target:
+                hi = mid
+            else:
+                lo = mid
+        self.bubble._zeta_raw.data.copy_(
+            _softplus_inverse(((lo + hi) / 2).exp()).to(self.bubble._zeta_raw.dtype))
+
+    def get_params_dict(self) -> dict:
+        d = self.bubble.get_params_dict()
+        d["alpha_nH_scale"] = float(self.equilibrium.alpha_nH_scale.item())
+        return d
+
+    def extra_repr(self) -> str:
+        return (f"hybrid(bubble × equilibrium), "
+                f"residual_scale={self.equilibrium.alpha_nH_scale.item():.4f}")

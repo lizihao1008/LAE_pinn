@@ -340,6 +340,53 @@ def test7_bubble_integration():
           f"x(q): mean={xq.mean():.3f}, range=[{xq.min():.3f},{xq.max():.3f}]")
 
 
+def test8_hybrid_integration():
+    """LAEPINN hybrid core x_HII=B·x_eq: continuous vs grid generator agree on-grid."""
+    print("\nTest 8: LAEPINN hybrid (bubble_equilibrium) — continuous vs grid (on-grid)")
+    try:
+        from models.pinn import LAEPINN
+    except Exception as e:
+        print(f"  [SKIP] torch_geometric/model unavailable ({type(e).__name__})")
+        return
+
+    torch.manual_seed(6)
+    Gi, N, nb = 16, 60, 2
+    graph = _build_graph_on_grid(Gi, N)
+    hod = torch.rand(nb, Gi, Gi, Gi, dtype=DT) + 0.5
+    density = torch.rand(Gi, Gi, Gi, dtype=DT) + 0.5
+
+    def build(gen):
+        torch.manual_seed(11)
+        return LAEPINN(
+            gnn_in_channels=8, gnn_hidden_dim=16, gnn_out_channels=8,
+            gnn_n_layers=2, gnn_heads=2, n_hod_bins=nb, grid_size=Gi, box_size=BOX,
+            excursion_type="bubble_equilibrium", bubble_zeta_init=0.3,
+            hybrid_residual_scale_init=0.1, field_generator=gen,
+        ).to(DT)
+
+    mc, mg = build("continuous"), build("grid")
+    mg.load_state_dict(mc.state_dict())
+    for m in (mc, mg):
+        m._amp_calibrated.fill_(True)   # skip calibration -> identical zeta/s/A_obs
+        m.eval()
+    with torch.no_grad():
+        oc = mc(graph, hod, density_grid=density)["x_hii_pred"]
+        og = mg(graph, hod, density_grid=density)["x_hii_pred"]
+    ma, mn, rl, cc = metrics(oc, og)
+    # Product of two ~1% agreements (bubble top-hat boundary + equilibrium fp32).
+    check("hybrid continuous == grid (on-grid)", rl < 3e-2 and cc > 0.999,
+          f"max|Δ|={ma:.2e}, relL2={rl:.2e}, corr={cc:.5f}  (xmean c={oc.mean():.3f} g={og.mean():.3f})")
+    check("hybrid field in [0,1]",
+          bool((oc >= 0).all() and (oc <= 1).all() and torch.isfinite(oc).all()),
+          f"range=[{oc.min():.3f},{oc.max():.3f}]")
+
+    ev, ctx = mc.continuous_field(graph, hod)   # off-grid hybrid evaluator
+    xq = ev.forward(torch.rand(128, 3, dtype=DT), **ctx)["x_hii"]
+    check("hybrid off-grid query interface",
+          bool(torch.isfinite(xq).all() and (xq >= 0).all() and (xq <= 1).all()),
+          f"x(q): mean={xq.mean():.3f}, range=[{xq.min():.3f},{xq.max():.3f}]")
+
+
 if __name__ == "__main__":
     print("=" * 68)
     print("Continuous ionization field — consistency verification")
@@ -352,6 +399,7 @@ if __name__ == "__main__":
     test5_gradient_flow()
     test6_pinn_integration()
     test7_bubble_integration()
+    test8_hybrid_integration()
     print("\n" + "=" * 68)
     print(f"RESULT: {'ALL TESTS PASSED' if PASS else 'SOME TESTS FAILED'}")
     print("=" * 68)

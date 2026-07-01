@@ -26,7 +26,9 @@ try:
     from ..physics.kernels import MixtureKernel, build_kernel, make_3d_kernel_grid
     from ..physics.scatter import scatter_to_grid, fft_convolve_3d
     from ..physics.unresolved_sources import HODUnresolvedField
-    from ..physics.excursion_set import ExcursionSetMapping, BubbleExcursionSet
+    from ..physics.excursion_set import (
+        ExcursionSetMapping, BubbleExcursionSet, HybridBubbleEquilibrium,
+    )
     from ..physics.continuous_field import (
         render_obs_field_on_grid, render_bubble_on_grid, calibrate_bubble_zeta,
     )
@@ -34,7 +36,9 @@ except ImportError:  # python -m experiments.run_mvp with project root on sys.pa
     from physics.kernels import MixtureKernel, build_kernel, make_3d_kernel_grid
     from physics.scatter import scatter_to_grid, fft_convolve_3d
     from physics.unresolved_sources import HODUnresolvedField
-    from physics.excursion_set import ExcursionSetMapping, BubbleExcursionSet
+    from physics.excursion_set import (
+        ExcursionSetMapping, BubbleExcursionSet, HybridBubbleEquilibrium,
+    )
     from physics.continuous_field import (
         render_obs_field_on_grid, render_bubble_on_grid, calibrate_bubble_zeta,
     )
@@ -84,6 +88,9 @@ class LAEPINN(nn.Module):
         bubble_zeta_init: float = 1.0,
         bubble_sharpness_init: float = 6.0,
         bubble_radii_mpc: list[float] | None = None,
+        # Hybrid (bubble_equilibrium): residual photoionization-equilibrium scale s.
+        # Small so x_eq ~ 1 inside bubbles (hybrid starts ~ pure bubble, then refines).
+        hybrid_residual_scale_init: float = 0.1,
         # Grid
         grid_size: int = 64,
         box_size: float = 160.0,
@@ -207,6 +214,18 @@ class LAEPINN(nn.Module):
                 sharpness_init=bubble_sharpness_init,
                 learnable=excursion_learnable,
             )
+        elif excursion_type == "bubble_equilibrium":
+            # Hybrid: x_HII = B(x) · x_eq(x).  Bubble sets the topology (sharp 0/1,
+            # real voids); photoionization equilibrium sets the interior residual.
+            self.excursion = HybridBubbleEquilibrium(
+                grid_size=grid_size,
+                box_size=box_size,
+                radii_mpc=bubble_radii_mpc,
+                zeta_init=bubble_zeta_init,
+                sharpness_init=bubble_sharpness_init,
+                residual_scale_init=hybrid_residual_scale_init,
+                learnable=excursion_learnable,
+            )
         else:
             # Photoionization balance Γ(1−x)n_H = α n_e n_p  →  x_HII(J) via A=J/s.
             # Single learnable s absorbs recombination coeff α and mean density n_H
@@ -287,16 +306,71 @@ class LAEPINN(nn.Module):
         #    ε_b(x) = 1 + b_b δ_dm(x) is the fixed HOD basis; only f_esc_b learned.
         S_unres = self.unresolved(hod_basis)              # (G, G, G)
 
-        use_continuous = (self.field_generator == "continuous"
-                          and self.excursion_type != "bubble")
-
         # A_obs balances the sparse LAE term against the HOD background.  Its base
         # is calibrated ONCE (mean(S_unres)/mean(S_obs) on the first batch) then
         # held fixed; _log_A_obs is the learnable deviation.  The base is FIXED,
         # not a per-step detached ratio (which would cancel the photon-budget
         # signal and collapse all f_esc bins via a spurious common-mode gradient).
 
-        if self.field_generator == "continuous" and self.excursion_type == "bubble":
+        if self.excursion_type == "bubble_equilibrium":
+            # ===== Hybrid core: x_HII = B(x) · x_eq(x) =====
+            #   B    : excursion-set bubble membership (topology, sharp 0/1, voids)
+            #   x_eq : photoionization-equilibrium ionized fraction on the propagated
+            #          field J (interior residual, x_HI ~ s/J).
+            # Built with the active field generator; A_obs calibrated on emissivity
+            # means, J_ref on mean(J), zeta on <B·x_eq> = xi (x_eq fixed).
+            if self.field_generator == "continuous":
+                J_obs_grid   = render_obs_field_on_grid(
+                    self.kernel, pos_scatter, w_eff, G, self.box_size,
+                    r_cut_mpc=self.cf_r_cut, chunk=self.cf_chunk)
+                J_unres_grid = fft_convolve_3d(S_unres, kernel_grid)
+                if not bool(self._amp_calibrated):
+                    with torch.no_grad():
+                        s_obs_m = (w_eff.sum() / float(G ** 3)).clamp(min=1e-12)
+                        s_unr_m = S_unres.mean().clamp(min=1e-12)
+                        self._A_obs_base.copy_(s_unr_m / s_obs_m)
+                A_obs   = self._A_obs_base * torch.exp(self._log_A_obs)
+                J_total = A_obs * J_obs_grid + J_unres_grid       # propagated field
+                if not bool(self._amp_calibrated):
+                    with torch.no_grad():
+                        self._J_ref.copy_(J_total.mean().clamp(min=1e-12))
+                        # zeta calib uses the (cheap) grid bubble on scattered emissivity
+                        S_emiss_c = A_obs * scatter_to_grid(pos_scatter, w_eff, G) + S_unres
+                        tgt = float(getattr(graph, "xi_global", 0.5))
+                        self.excursion.calibrate_zeta(
+                            S_emiss_c, J_total / self._J_ref,
+                            density=density_grid, target=tgt)
+                        self._amp_calibrated.fill_(True)
+                J_ref = self._J_ref
+                B     = render_bubble_on_grid(
+                    self.excursion.bubble, pos_scatter, w_eff, A_obs, S_unres,
+                    density_grid, self.box_size, grid_size=G, chunk=self.cf_chunk)
+                x_eq  = self.excursion.equilibrium(J_total / J_ref)
+                x_hii_pred  = (B * x_eq).clamp(0.0, 1.0)
+                S_obs       = J_obs_grid                          # diagnostics
+                S_obs_scale = (w_eff.sum() / float(G ** 3)).detach()
+            else:
+                S_obs   = scatter_to_grid(pos_scatter, w_eff, G)
+                if not bool(self._amp_calibrated):
+                    with torch.no_grad():
+                        s_obs_m = S_obs.mean().clamp(min=1e-12)
+                        s_unr_m = S_unres.mean().clamp(min=1e-12)
+                        self._A_obs_base.copy_(s_unr_m / s_obs_m)
+                A_obs   = self._A_obs_base * torch.exp(self._log_A_obs)
+                S_emiss = A_obs * S_obs + S_unres
+                J_total = fft_convolve_3d(S_emiss, kernel_grid)
+                if not bool(self._amp_calibrated):
+                    with torch.no_grad():
+                        self._J_ref.copy_(J_total.mean().clamp(min=1e-12))
+                        tgt = float(getattr(graph, "xi_global", 0.5))
+                        self.excursion.calibrate_zeta(
+                            S_emiss, J_total / self._J_ref,
+                            density=density_grid, target=tgt)
+                        self._amp_calibrated.fill_(True)
+                J_ref = self._J_ref
+                x_hii_pred  = self.excursion(S_emiss, J_total / J_ref, density=density_grid)
+                S_obs_scale = S_obs.mean().detach()
+        elif self.field_generator == "continuous" and self.excursion_type == "bubble":
             # ---- Continuous bubble generator (top-hat excursion-set, mesh-free obs) ----
             #   Observed sources enter each scale's top-hat smoothing as an EXACT
             #   kernel sum (no scatter voxel smearing); S_unres and n_H are smoothed
@@ -329,8 +403,8 @@ class LAEPINN(nn.Module):
             S_obs = scatter_to_grid(pos_scatter, w_eff, G)
             J_total = A_obs * S_obs + S_unres
             S_obs_scale = (w_eff.sum() / float(G ** 3)).detach()
-        elif use_continuous:
-            # ---- Continuous generator: J_obs(x)=Σ_i w_i K(|x-x_i|) on the grid ----
+        elif self.field_generator == "continuous":
+            # ---- Continuous generator (equilibrium): J_obs(x)=Σ_i w_i K(|x-x_i|) ----
             #   Drop-in for scatter_to_grid + fft_convolve_3d of the observed term,
             #   but with EXACT source positions (no trilinear voxel smearing).  The
             #   unit-sum kernel preserves means, so mean(J_obs_grid)=mean(S_obs)
@@ -432,8 +506,11 @@ class LAEPINN(nn.Module):
             params.update(self.kernel.get_params_dict())
         # f_esc per HOD mass bin (keys: "fesc_bin0", "fesc_bin1", ...)
         params.update(self.unresolved.get_fesc_dict())
-        # ionization-mapping parameters (equilibrium: alpha_nH_scale; bubble: zeta, sharpness)
-        if self.excursion_type == "bubble":
+        # ionization-mapping parameters
+        #   equilibrium        : alpha_nH_scale
+        #   bubble             : zeta, sharpness
+        #   bubble_equilibrium : zeta, sharpness, alpha_nH_scale (residual)
+        if self.excursion_type in ("bubble", "bubble_equilibrium"):
             params.update(self.excursion.get_params_dict())
         else:
             params["alpha_nH_scale"] = float(self.excursion.alpha_nH_scale.item())
@@ -504,6 +581,7 @@ def build_pinn_from_config(cfg: dict) -> LAEPINN:
         bubble_zeta_init=exc_cfg.get("zeta_init", 1.0),
         bubble_sharpness_init=exc_cfg.get("bubble_sharpness_init", 6.0),
         bubble_radii_mpc=exc_cfg.get("bubble_radii_mpc", None),
+        hybrid_residual_scale_init=exc_cfg.get("hybrid_residual_scale_init", 0.1),
         grid_size=data_cfg.get("grid_mvp", 64),
         box_size=data_cfg.get("box_size_mpc", 160.0),
         field_generator=field_generator,

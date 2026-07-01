@@ -188,8 +188,9 @@ centres against `scatter → fft_convolve_3d → equilibrium`:
 | 5 | gradient flow                     | grads reach `w_i`, `R/λ`, `α_nH` |
 | 6 | `LAEPINN` equilibrium: continuous vs grid generator (on-grid) | match to fp32; off-grid query OK |
 | 7 | `LAEPINN` bubble: continuous vs grid generator (on-grid)      | corr `>0.999`; off-grid query OK |
+| 8 | `LAEPINN` hybrid (`bubble_equilibrium`): continuous vs grid (on-grid) | corr `>0.999`; `x∈[0,1]`; off-grid query OK |
 
-Independent NumPy mirrors (float64) confirm both cores:
+Independent NumPy mirrors (float64) confirm all cores:
 
 - *Equilibrium* — `A_obs` calibration is generator-invariant
   (`mean(J_obs_grid)/mean(S_obs) − 1 ≈ 2e-14`,
@@ -199,6 +200,9 @@ Independent NumPy mirrors (float64) confirm both cores:
   boundary** (a source at distance ≈ R can land on either side of the threshold
   between the two float paths) plus the off-grid voxel smearing — not machine-eps,
   but a faithful match.
+- *Hybrid* (`B·x_eq`) — continuous vs grid on-grid corr `0.99997` (relL2 `4e-3`);
+  the product inherits the bubble's top-hat-boundary residual (x_eq matches to
+  fp32), confirming the two factors compose consistently.
 
 **Precision note.** `physics/scatter.fft_convolve_3d` casts its inputs with
 `.float()`, so the **grid reference is only float32-accurate** (`max|Δ|~1e-5`,
@@ -230,6 +234,41 @@ cd LAE_pinn && python experiments/test_continuous_field.py
   autodiff (no finite differences) — localises HII-bubble fronts directly.
 
 ---
+
+## 8b. Hybrid core: bubble topology × photoionization equilibrium
+
+`excursion_type: bubble_equilibrium` (`HybridBubbleEquilibrium`) makes the bubble
+interior satisfy photoionization equilibrium:
+
+$$x_{\rm HII}(\mathbf{x}) = B(\mathbf{x})\cdot x_{\rm HII}^{\rm eq}(\mathbf{x})$$
+
+- `B(x)` — excursion-set bubble membership (photon-budget topology, sharp 0/1,
+  genuine neutral voids). Answers *where* gas is ionized.
+- `x_eq(x)` — photoionization-equilibrium ionized fraction on the propagated field
+  `J`, `x_eq = (√(A²+4A)−A)/2`, `A = (J/J_ref)/s`. Sets *how* ionized inside
+  (residual `x_HI ≈ s/J`).
+
+Equivalently `x_HI = (1−B)·1 + B·x_HI_eq`: fully neutral outside bubbles, the
+photoionization-equilibrium residual inside. This is the standard semi-numerical
+topology + post-reionization UVB-residual picture (cf. 21cmFAST). Both factors use
+the active field generator (continuous top-hat sum for `B`, kernel-integral for
+`x_eq`), so the hybrid is mesh-free and queryable off-grid via
+`model.continuous_field(...)`.
+
+Calibration is joint but well-separated: `zeta` is bisected on `⟨B·x_eq⟩ = ξ`
+(topology / volume fraction), while the residual scale `s` (`hybrid_residual_scale_init`,
+default 0.1) is small so `x_eq ≈ 1` inside bubbles — the hybrid **starts ≈ the pure
+bubble** and refines the interior residual during training (`s` learned by the field
+losses). No loss changes; `x_hii_pred` is still a `[0,1]` field.
+
+```yaml
+excursion_set:
+  type: bubble_equilibrium
+  hybrid_residual_scale_init: 0.1
+```
+```
+python -m experiments.run_mvp ... --excursion bubble_equilibrium
+```
 
 ## 9. Limitations and next steps
 

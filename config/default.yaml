@@ -13,7 +13,7 @@ data:
 
 graph:
   k_neighbors: 16
-  r_link_mpc: 15.0                    # max edge radius (cMpc/h)
+  r_link_mpc: 20.0                    # max edge radius (cMpc/h)
   node_features:                      # names must match data loader output
     - pos_x
     - pos_y
@@ -73,6 +73,10 @@ unresolved_sources:
   # HOD-based faint source model.  Basis fields are pre-computed once before
   # training from the halo catalog (simulation) or ACF-fitted HOD (observations).
   # Only f_esc per mass bin is learned during training.
+  model: linear                      # linear | conditional  (run_from_config / run_mvp)
+  profile_source: observed_acf        # conditional only: observed_acf | cof | powerlaw
+  dv_max_kms: 1000.0                  # conditional only: LOS window [km/s]
+  n_lae_mass_bins: 4                  # conditional only: LAE mass bins in the stack
   #
   # Bin edges are generated dynamically from data.muv_cut to -15.0 in 0.5 mag steps
   # by run_mvp.py (and other runners), so n_hod_bins here is informational only —
@@ -91,6 +95,15 @@ unresolved_sources:
     # mean_log_lum_per_bin: [40.1, 39.5, 38.8]  # log10(L_Lyα) from abundance matching
 
 excursion_set:
+  # type: "equilibrium" | "bubble" | "bubble_equilibrium"
+  #   equilibrium        — smooth x(J) = (√(A²+4A)−A)/2, A = J/s (satisfies
+  #                        photoionization equilibrium; floors above 0 in voids)
+  #   bubble             — excursion-set photon-counting threshold (sharp 0/1
+  #                        topology, real neutral voids; no interior residual)
+  #   bubble_equilibrium — HYBRID x_HII = B(x)·x_eq(x): bubble topology × the
+  #                        photoionization-equilibrium interior residual. Makes the
+  #                        bubble interior satisfy photoionization equilibrium.
+  type: equilibrium
   # s = alpha_nH_scale: one scalar for α(T)·⟨n_H⟩ + J unit conversion
   # Mapping: A = g·J/s,  x_HII = (√(A²+4A)−A)/2;  g from global ξ constraint
   #
@@ -99,6 +112,9 @@ excursion_set:
   # Example: xi=0.308 → alpha_init ≈ 7.3.  The default of 1.0 is 6× too
   # small and causes x_pred to be pinned above 0.5 for hundreds of epochs.
   alpha_nH_scale_init: 1.0   # overridden by runners; do not rely on this value
+  # Hybrid only: residual photoionization scale s. Small → x_eq ~ 1 inside
+  # bubbles, so the hybrid starts ~ the pure bubble and refines the interior.
+  hybrid_residual_scale_init: 0.1
 
 training:
   batch_size: 1                       # 1 snapshot per step (full-field)
@@ -127,6 +143,12 @@ experiment:
   device: cuda                        # or cpu
   save_dir: "runs/"
   log_every: 10
+
+# MVP single-snapshot run (python -m experiments.run_mvp --config)
+mvp:
+  redshift: 7.14                      # defaults to data.redshifts[0] if omitted
+  save_subdir: mvp                      # output → runs/mvp/
+  subsample: null                       # max halos in graph (null = all)
 
 # ============================================================
 # Source degeneracy stress tests

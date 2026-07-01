@@ -4,6 +4,13 @@ End-to-end MVP validation run.
 
 Usage:
     cd LAE_pinn/
+    # All hyperparameters from config/default.yaml:
+    python -m experiments.run_mvp --config
+
+    # YAML + optional CLI overrides (e.g. change redshift only):
+    python -m experiments.run_mvp --config --redshift 6.6
+
+    # Classic CLI-only (no yaml):
     python -m experiments.run_mvp --sim_root ../simulation --redshift 7.14
 
 Steps:
@@ -29,48 +36,96 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data import load_snapshot, apply_source_model, compute_feature_stats, prepare_snapshot
 from data.graph_builder import build_graph_from_snapshot
-from models.pinn import LAEPINN
+from models.pinn import LAEPINN, build_pinn_from_config
 from training.train import train
 from evaluation.topology import compute_all_topology
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--sim_root",   default="../simulation")
-    p.add_argument("--redshift",   type=float, default=7.14)
-    p.add_argument("--muv_cut",    type=float, default=-19,
+    p = argparse.ArgumentParser(
+        description="LAEPINN MVP training run",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--config", nargs="?", const="config/default.yaml", default=None,
+        metavar="YAML",
+        help="Load hyperparameters from YAML. Omit the path to use config/default.yaml. "
+             "Any explicit CLI flags below override the yaml values.",
+    )
+    p.add_argument("--sim_root",   default=argparse.SUPPRESS)
+    p.add_argument("--redshift",   type=float, default=argparse.SUPPRESS)
+    p.add_argument("--muv_cut",    type=float, default=argparse.SUPPRESS,
                    help="MUV cut for observed LAEs. Use -99 for all halos.")
-    p.add_argument("--grid",       type=int, default=64)
-    p.add_argument("--epochs",     type=int, default=100)
-    p.add_argument("--lr",         type=float, default=1e-3)
-    p.add_argument("--device",     default="cuda")
-    p.add_argument("--save_dir",   default="runs/mvp")
-    p.add_argument("--k_neighbors", type=int, default=16)
-    p.add_argument("--r_link",     type=float, default=15.0)
-    p.add_argument("--subsample",  type=int, default=None,
+    p.add_argument("--grid",       type=int, default=argparse.SUPPRESS)
+    p.add_argument("--epochs",     type=int, default=argparse.SUPPRESS)
+    p.add_argument("--lr",         type=float, default=argparse.SUPPRESS)
+    p.add_argument("--device",     default=argparse.SUPPRESS)
+    p.add_argument("--save_dir",   default=argparse.SUPPRESS)
+    p.add_argument("--k_neighbors", type=int, default=argparse.SUPPRESS)
+    p.add_argument("--r_link",     type=float, default=argparse.SUPPRESS)
+    p.add_argument("--subsample",  type=int, default=argparse.SUPPRESS,
                    help="Subsample N halos for speed (None = use all)")
     # --- unresolved-source model + ionization core ---
-    p.add_argument("--unresolved", choices=["linear", "conditional"], default="linear",
+    p.add_argument("--unresolved", choices=["linear", "conditional"], default=argparse.SUPPRESS,
                    help="linear = (1+b*delta) bias field; "
                         "conditional = COF-ACF stack of faint excess around LAEs (voids -> 0)")
-    p.add_argument("--excursion", choices=["equilibrium", "bubble"], default="equilibrium",
-                   help="equilibrium = smooth x(J); bubble = excursion-set threshold (sharp 0/1)")
-    p.add_argument("--field_generator", choices=["continuous", "grid"], default="continuous",
+    p.add_argument("--excursion", choices=["equilibrium", "bubble", "bubble_equilibrium"],
+                   default=argparse.SUPPRESS,
+                   help="equilibrium = smooth x(J); bubble = excursion-set threshold (sharp 0/1); "
+                        "bubble_equilibrium = hybrid x_HII = B(x)·x_eq(x) (bubble topology × "
+                        "photoionization-equilibrium interior residual)")
+    p.add_argument("--field_generator", choices=["continuous", "grid"], default=argparse.SUPPRESS,
                    help="observed-source field generator. continuous (default) = mesh-free "
                         "kernel/top-hat sum over EXACT source positions (removes scatter voxel "
                         "smearing, queryable off-grid); supports BOTH equilibrium and bubble "
                         "cores. grid = legacy scatter+FFT. Continuous bubble costs ~n_scales×(G³·N) "
                         "per step; use --field_generator grid to fall back if needed.")
-    p.add_argument("--dv_max", type=float, default=1000.0,
+    p.add_argument("--dv_max", type=float, default=argparse.SUPPRESS,
                    help="LOS redshift-space window [km/s] for conditional profiles")
-    p.add_argument("--n_lae_mass_bins", type=int, default=4,
+    p.add_argument("--n_lae_mass_bins", type=int, default=argparse.SUPPRESS,
                    help="number of LAE halo-mass bins for the conditional stack")
     p.add_argument("--profile_source", choices=["observed_acf", "cof", "powerlaw"],
-                   default="observed_acf",
+                   default=argparse.SUPPRESS,
                    help="conditional spatial template: observed_acf = measured from the "
                         "MUV-cut LAE auto-correlation (observable, no oracle, no HOD fit); "
                         "cof = COF_tools halo-model CCF (observation transfer); powerlaw = test")
-    return p.parse_args()
+    cli = p.parse_args()
+
+    if cli.config is not None:
+        from config.load_config import load_config, mvp_settings_from_config
+        args = mvp_settings_from_config(load_config(cli.config))
+        for k, v in vars(cli).items():
+            if k == "config" or v is None:
+                continue
+            setattr(args, k, v)
+        return args
+
+    # No --config: classic CLI defaults, overridden by any explicit flags
+    defaults = dict(
+        sim_root="../simulation",
+        redshift=7.14,
+        muv_cut=-19.0,
+        grid=64,
+        epochs=100,
+        lr=1e-3,
+        device="cuda",
+        save_dir="runs/mvp",
+        k_neighbors=16,
+        r_link=15.0,
+        subsample=None,
+        unresolved="linear",
+        excursion="equilibrium",
+        field_generator="continuous",
+        dv_max=1000.0,
+        n_lae_mass_bins=4,
+        profile_source="observed_acf",
+        muv_faint_limit=-15.0,
+        muv_bin_step=0.5,
+        seed=None,
+        _yaml_cfg=None,
+    )
+    defaults.update({k: v for k, v in vars(cli).items() if k != "config"})
+    return argparse.Namespace(**defaults)
 
 
 def field_metrics(x_pred: np.ndarray, x_true: np.ndarray) -> dict:
@@ -91,9 +146,14 @@ def field_metrics(x_pred: np.ndarray, x_true: np.ndarray) -> dict:
     return {"mse": mse, "mae": mae, "iou": iou, "pearson": corr}
 
 
-def main():
-    args = parse_args()
+def main(args=None):
+    if args is None:
+        args = parse_args()
     device = torch.device(args.device)
+
+    if getattr(args, "seed", None) is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
 
     print(f"\n{'='*60}")
     print(f"  LAE_pinn MVP  |  z={args.redshift}  |  MUV<{args.muv_cut}")
@@ -122,8 +182,8 @@ def main():
     # Bins end at -15 because the simulation has virtually no halos fainter than that.
     # The last bin in build_hod_basis_from_simulation is always open-ended (MUV > last edge),
     # which captures any residual halos below -15 without needing an explicit upper bound.
-    muv_faint_limit = -15.0
-    muv_bin_step    = 0.5
+    muv_faint_limit = getattr(args, "muv_faint_limit", -15.0)
+    muv_bin_step    = getattr(args, "muv_bin_step", 0.5)
     muv_bin_edges   = list(np.arange(args.muv_cut, muv_faint_limit + 1e-6, muv_bin_step))
     n_hod_bins      = len(muv_bin_edges)   # last bin open-ended: MUV > muv_faint_limit
     print(f"  HOD bins: {n_hod_bins} bins from MUV={muv_bin_edges[0]:.1f} "
@@ -174,7 +234,7 @@ def main():
 
     # Attach the gas-density grid n_H ∝ (1+δ) for the bubble core (optional;
     # the equilibrium core ignores it).  Downsampled from the native 512³ field.
-    if args.excursion == "bubble" and snap.dbox_512 is not None:
+    if args.excursion in ("bubble", "bubble_equilibrium") and snap.dbox_512 is not None:
         from data.preprocessing import downsample_grid
         dens = downsample_grid(snap.dbox_512, args.grid)         # δ (contrast)
         dens = np.clip(1.0 + dens, 0.0, None)                    # n_H ∝ (1+δ)
@@ -194,23 +254,32 @@ def main():
     alpha_init = 1.0 / max(A_target, 1e-6)
     print(f"  alpha_nH_scale_init = {alpha_init:.2f}  (xi_global={xi_val:.3f} → A_target={A_target:.3f})")
 
-    model = LAEPINN(
-        gnn_in_channels=8,
-        gnn_hidden_dim=64,
-        gnn_out_channels=32,
-        gnn_n_layers=3,
-        gnn_heads=4,
-        kernel_type="mixture",
-        kernel_R_init=5.0,
-        kernel_delta_init=1.0,
-        kernel_lambda_mfp_init=20.0,
-        n_hod_bins=n_hod_bins,
-        grid_size=args.grid,
-        box_size=snap.box_size,
-        excursion_type=args.excursion,
-        alpha_nH_scale_init=alpha_init,
-        field_generator=args.field_generator,
-    )
+    yaml_cfg = getattr(args, "_yaml_cfg", None)
+    if yaml_cfg is not None:
+        cfg_for_model = dict(yaml_cfg)
+        cfg_for_model.setdefault("data", {})["grid_mvp"] = args.grid
+        cfg_for_model.setdefault("data", {})["box_size_mpc"] = snap.box_size
+        cfg_for_model.setdefault("unresolved_sources", {})["n_hod_bins"] = n_hod_bins
+        cfg_for_model.setdefault("excursion_set", {})["alpha_nH_scale_init"] = alpha_init
+        model = build_pinn_from_config(cfg_for_model)
+    else:
+        model = LAEPINN(
+            gnn_in_channels=8,
+            gnn_hidden_dim=64,
+            gnn_out_channels=32,
+            gnn_n_layers=3,
+            gnn_heads=4,
+            kernel_type="mixture",
+            kernel_R_init=5.0,
+            kernel_delta_init=1.0,
+            kernel_lambda_mfp_init=20.0,
+            n_hod_bins=n_hod_bins,
+            grid_size=args.grid,
+            box_size=snap.box_size,
+            excursion_type=args.excursion,
+            alpha_nH_scale_init=alpha_init,
+            field_generator=args.field_generator,
+        )
     print(f"  Ionization core: {args.excursion}")
     print(f"  Field generator: {args.field_generator}"
           + ("  (mesh-free; ~n_scales×G³·N per step for bubble)"
@@ -219,25 +288,26 @@ def main():
     print(f"  Trainable parameters: {n_params:,}")
 
     # ---- 5. Train ----
-    cfg = {
-        "training": {
-            "n_epochs": args.epochs,
-            "lr": args.lr,
-            "warmup_epochs": 10,
-            "weight_decay": 1e-5,
-            "loss_weights": {
-                "field_mse":      1.0,
-                "power_spectrum": 0.1,
-                "binary_bce":     0.5,
-                # global_xHII needs a high weight to drive alpha_nH_scale fast.
-                # With uniform J_norm, the excursion gradient on alpha is tiny,
-                # so a weak xHII weight leaves alpha stuck near init for hundreds of epochs.
-                "global_xHII":   10.0,
-                "prior":          0.1,
+    if yaml_cfg is not None:
+        from config.load_config import training_cfg_from_yaml
+        cfg = training_cfg_from_yaml(yaml_cfg, n_epochs=args.epochs)
+    else:
+        cfg = {
+            "training": {
+                "n_epochs": args.epochs,
+                "lr": args.lr,
+                "warmup_epochs": 10,
+                "weight_decay": 1e-5,
+                "loss_weights": {
+                    "field_mse":      1.0,
+                    "power_spectrum": 0.1,
+                    "binary_bce":     0.5,
+                    "global_xHII":   10.0,
+                    "prior":          0.1,
+                },
             },
-        },
-        "experiment": {"log_every": max(1, args.epochs // 10)},
-    }
+            "experiment": {"log_every": max(1, args.epochs // 10)},
+        }
     print(f"\nTraining for {args.epochs} epochs...\n")
     history = train(model, [graph], cfg, save_dir=args.save_dir,
                     device=device, verbose=True)
